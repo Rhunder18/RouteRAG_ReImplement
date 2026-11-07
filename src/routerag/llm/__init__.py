@@ -7,8 +7,6 @@ from .openai_gpt import CacheOpenAI
 from .base import BaseLLM
 from .gateway_llm import OpenAICompatibleGatewayLLM
 from .gateways import GATEWAYS, GatewaySpec, find_gateway
-from .transformers_llm import TransformersLLM
-from .unsloth_llm import UnslothLLM
 
 logger = get_logger(__name__)
 
@@ -17,11 +15,5 @@ def _get_llm_class(config: BaseConfig):
     gateway = find_gateway(config.llm_name)
     if gateway is not None:
         return OpenAICompatibleGatewayLLM(config, gateway)
-
-    if config.llm_name.startswith('Transformers/'):
-        return TransformersLLM(config)
-    
-    if config.llm_name.startswith('Unsloth/'):
-        return UnslothLLM(config)
         
     return CacheOpenAI.from_experiment_config(config)

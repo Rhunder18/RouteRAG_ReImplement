@@ -4,14 +4,14 @@ with open("README.md", "r", encoding="utf-8") as f:
     long_description = f.read()
 
 setuptools.setup(
-    name="hipporag",
-    version="2.0.0a5",
-    author="Bernal Jimenez Gutierrez",
-    author_email="jimenezgutierrez.1@osu.edu",
-    description="A powerful graph-based RAG framework that enables LLMs to identify and leverage connections within new knowledge for improved retrieval.",
+    name="routerag",
+    version="1.0",
+    author="",
+    author_email="",
+    description="",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/OSU-NLP-Group/HippoRAG",
+    url="",
     package_dir={"": "src"},
     packages=setuptools.find_packages("src"),
     python_requires=">=3.10",
@@ -46,7 +46,7 @@ setuptools.setup(
         "vllm": ["vllm"],
         "mcp": ["mcp>=2.2,<3"],
     },
-    entry_points={"console_scripts": ["hipporag-mcp=hipporag.mcp_server:main"]},
-    package_data={"hipporag": ["prompts/dspy_prompts/*.json"]},
+    entry_points={"console_scripts": ["routerag-mcp=routerag.mcp_server:main"]},
+    package_data={"routerag": ["prompts/dspy_prompts/*.json"]},
     include_package_data=True,
 )

@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hipporag"
-version = "2.0.0a5"
-description = "A powerful graph-based RAG framework that enables LLMs to identify and leverage connections within new knowledge for improved retrieval."
+name = "routerag"
+version = "1.0"
+description = ""
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -37,11 +37,11 @@ qdrant = ["qdrant-client>=1.9"]
 chroma = ["chromadb>=0.5"]
 transformers-embedding = ["sentence-transformers>=3.0"]
 gritlm = ["gritlm==1.0.2"]
-vllm = ["vllm==0.6.6.post1"]
+vllm = ["vllm"]
 mcp = ["mcp>=2.2,<3"]
 
 [project.scripts]
-hipporag-mcp = "hipporag.mcp_server:main"
+routerag-mcp = "routerag.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

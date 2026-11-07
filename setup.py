@@ -17,7 +17,7 @@ setuptools.setup(
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.5.1",
-        "transformers>=4.45.2",
+        "transformers==4.57.6",
         "openai>=3.3.1,<4",
         "litellm==1.73.1",
         "networkx>=3.4.2",
@@ -43,7 +43,7 @@ setuptools.setup(
         "chroma": ["chromadb>=0.5"],
         "transformers-embedding": ["sentence-transformers>=3.0"],
         "gritlm": ["gritlm==1.0.2"],
-        "vllm": ["vllm==0.6.6.post1"],
+        "vllm": ["vllm"],
         "mcp": ["mcp>=2.2,<3"],
     },
     entry_points={"console_scripts": ["hipporag-mcp=hipporag.mcp_server:main"]},

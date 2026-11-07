@@ -96,7 +96,8 @@ class HippoRAG:
                  index_identity=None,
                  embedding_provider=None,
                  llm_api_key_env=None,
-                 embedding_api_key_env=None):
+                 embedding_api_key_env=None,
+                 retrieval_only: bool = False):
         """
         Initializes an instance of the class and its related components.
 
@@ -125,6 +126,7 @@ class HippoRAG:
                 directory based on the class name and timestamp.
             llm_model_name: LLM model name, can be inserted directly as well as through configuration file.
             embedding_model_name: Embedding model name, can be inserted directly as well as through configuration file.
+            retrieval_only: Load an existing index without initializing the extraction LLM or OpenIE.
             llm_base_url: LLM URL for a deployed LLM model, can be inserted directly as well as through configuration file.
             llm_api_key_env: Environment variable holding the LLM API key for an OpenAI-compatible endpoint.
             embedding_api_key_env: Environment variable holding the API key for an OpenAI-compatible embedding endpoint.
@@ -181,6 +183,9 @@ class HippoRAG:
         if index_identity is not None and (not isinstance(index_identity, str) or not index_identity.strip()):
             raise ValueError("index_identity must be a non-empty string when provided.")
         self.index_identity = index_identity
+        self.retrieval_only = retrieval_only
+        if self.retrieval_only and self.global_config.openie_mode == "offline":
+            raise ValueError("retrieval_only requires an online OpenIE mode because offline mode does not initialize embeddings.")
         injected_index_producer = embedding_model is not None or extraction_llm is not None or text_preprocessor is not None
         if index_identity is None and injected_index_producer:
             raise ValueError("index_identity is required when injecting an embedding model, extraction LLM, or text preprocessor.")
@@ -199,8 +204,11 @@ class HippoRAG:
             os.makedirs(self.working_dir, exist_ok=True)
 
         self._owns_openie = False
-        if self.global_config.openie_mode == 'offline':
-            self._owns_llm_model = False
+        self._owns_llm_model = False
+        self.extraction_llm = None
+        if self.retrieval_only:
+            self.openie = None
+        elif self.global_config.openie_mode == 'offline':
             self.extraction_llm = extraction_llm
             from .information_extraction.openie_vllm_offline import VLLMOfflineOpenIE
             self.openie = self._construct_or_cleanup(lambda: VLLMOfflineOpenIE(self.global_config))
@@ -299,11 +307,15 @@ class HippoRAG:
             "embedding": embedding_index_identity(self.global_config),
             "components": {
                 "embedding_model": component_class_identity(self.embedding_model) if self.embedding_model is not None else None,
-                "extraction_llm": component_class_identity(self.extraction_llm),
+                "extraction_llm": (
+                    self._stored_extraction_llm_identity()
+                    if self.retrieval_only
+                    else component_class_identity(self.extraction_llm)
+                ),
                 "text_preprocessor": component_class_identity(self.text_preprocessor),
                 "explicit_identity": self.index_identity,
             },
-            "openie": self._openie_provenance_for_manifest(),
+            "openie": self._stored_openie_provenance() if self.retrieval_only else self._openie_provenance_for_manifest(),
             "graph_construction": {
                 "synonymy_edge_topk": self.global_config.synonymy_edge_topk,
                 "synonymy_edge_sim_threshold": self.global_config.synonymy_edge_sim_threshold,
@@ -320,6 +332,37 @@ class HippoRAG:
             ),
             allow_empty_rewrite=self.global_config.force_openie_from_scratch,
         )
+
+    def _stored_extraction_llm_identity(self) -> Optional[str]:
+        if not self.retrieval_only:
+            return component_class_identity(self.extraction_llm)
+        if not os.path.isfile(self.index_manifest_path):
+            raise StateConsistencyError(
+                f"retrieval_only requires an existing index manifest at {self.index_manifest_path}."
+            )
+        try:
+            with open(self.index_manifest_path, encoding="utf-8") as manifest_file:
+                manifest = json.load(manifest_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise StateConsistencyError(f"Cannot read index manifest {self.index_manifest_path}: {exc}") from exc
+        return manifest.get("components", {}).get("extraction_llm")
+
+    def _stored_openie_provenance(self) -> Dict[str, Any]:
+        if not self.retrieval_only:
+            return self._openie_provenance_for_manifest()
+        if not os.path.isfile(self.index_manifest_path):
+            raise StateConsistencyError(
+                f"retrieval_only requires an existing index manifest at {self.index_manifest_path}."
+            )
+        try:
+            with open(self.index_manifest_path, encoding="utf-8") as manifest_file:
+                manifest = json.load(manifest_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise StateConsistencyError(f"Cannot read index manifest {self.index_manifest_path}: {exc}") from exc
+        provenance = manifest.get("openie")
+        if not isinstance(provenance, dict):
+            raise StateConsistencyError(f"Invalid OpenIE provenance in {self.index_manifest_path}.")
+        return provenance
 
     def _openie_state_identity(self) -> Dict[str, Any]:
         return {
@@ -367,6 +410,8 @@ class HippoRAG:
     def _validate_openie_provenance(self, provenance: Any, source_path: str) -> Dict[str, Any]:
         if not isinstance(provenance, dict) or provenance.get("identity") != self._openie_state_identity():
             raise StateConsistencyError(f"OpenIE provenance is missing or incompatible in {source_path}. Use a fresh save_dir or force a full re-extraction before building derived state.")
+        if self.retrieval_only:
+            return provenance
         stored_producer = provenance.get("producer")
         current_producer = self._current_openie_provenance()["producer"]
         phase_transition = isinstance(stored_producer, dict) and stored_producer.get("mode") == "offline" and current_producer["mode"] == "online"

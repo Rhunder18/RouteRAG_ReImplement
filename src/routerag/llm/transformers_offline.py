@@ -1,6 +1,7 @@
 from typing import List
 import torch.cuda
-import outlines
+import outlines.generate as generate
+import outlines.models as models
 
 from .base import LLMConfig
 from ..utils.llm_utils import TextChatMessage, get_pydantic_model
@@ -70,13 +71,16 @@ class TransformersOffline:
 
         all_prompt_texts = [convert_text_chat_messages_to_input_string(messages, self.tokenizer) for messages in messages_list]
 
+        guided = None
         if json_template is not None:
             guided_json=get_pydantic_model(json_template)
-            outlines_model = outlines.from_transformers(self.model, self.tokenizer)
-            all_responses = [
-                outlines_model(prompt_text, guided_json, max_new_tokens=max_tokens)
-                for prompt_text in all_prompt_texts
-            ]
+            outlines_model = models.Transformers(self.model, self.tokenizer)
+            generator = generate.json(outlines_model, guided_json)
+            transformers_outputs = []
+            for i in range(0, len(all_prompt_texts), 4):
+                transformers_output = generator(all_prompt_texts[i:i+4], max_tokens=max_tokens)
+                transformers_outputs.extend(transformers_output)
+            all_responses = [completion.model_dump_json() for completion in transformers_outputs]
         else:
             all_responses = [self._generate_text(prompt_text, max_tokens) for prompt_text in all_prompt_texts]
         if len(all_responses) != len(messages_list):

@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 import json
 
 import torch
@@ -15,14 +15,21 @@ class TransformersEmbeddingModel(BaseEmbeddingModel):
     To select this implementation you can initialise HippoRAG with:
         embedding_model_name starts with "Transformers/"
     """
-    def __init__(self, global_config:BaseConfig, embedding_model_name:str, device:str) -> None:
+    def __init__(
+        self,
+        global_config: BaseConfig,
+        embedding_model_name: str,
+        device: Optional[str] = None,
+    ) -> None:
         super().__init__(global_config=global_config)
 
         self.model_id = embedding_model_name.removeprefix("Transformers/")
         self.embedding_type = 'float'
         self.batch_size = global_config.embedding_batch_size
 
-        self.model = SentenceTransformer(self.model_id, device = device)
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = SentenceTransformer(self.model_id, device=device)
 
         self.search_query_instr = set([
             get_query_instruction('query_to_fact'),

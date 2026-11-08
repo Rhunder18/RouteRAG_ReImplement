@@ -78,168 +78,166 @@ class HippoRAG:
             raise
 
     def __init__(self,
-                 global_config=None,
-                 save_dir=None,
-                 llm_model_name=None,
-                 llm_base_url=None,
-                 embedding_model_name=None,
-                 embedding_base_url=None,
-                 azure_endpoint=None,
-                 azure_embedding_endpoint=None,
-                 extraction_llm: BaseLLM = None,
-                 embedding_model: BaseEmbeddingModel = None,
-                 text_preprocessor: BaseTextPreprocessor = None,
-                 azure_api_version=None,
-                 azure_chat_deployment=None,
-                 azure_embedding_api_version=None,
-                 azure_embedding_deployment=None,
-                 index_identity=None,
-                 embedding_provider=None,
-                 llm_api_key_env=None,
-                 embedding_api_key_env=None,
-                 retrieval_only: bool = False):
-        """
-        Initializes an instance of the class and its related components.
-
-        Attributes:
-            global_config (BaseConfig): The global configuration settings for the instance. An instance
-                of BaseConfig is used if no value is provided.
-            saving_dir (str): The directory where specific HippoRAG instances will be stored. This defaults
-                to `outputs` if no value is provided.
-            openie (Union[OpenIE, VLLMOfflineOpenIE]): The Open Information Extraction module
-                configured in either online or offline mode based on the global settings.
-            graph: The graph instance initialized by the `initialize_graph` method.
-            embedding_model (BaseEmbeddingModel): The embedding model associated with the current
-                configuration.
-            chunk_embedding_store: The embedding store handling chunk embeddings.
-            entity_embedding_store: The embedding store handling entity embeddings.
-            fact_embedding_store: The embedding store handling fact embeddings.
-            openie_results_path (str): The file path for storing Open Information Extraction results
-                based on the dataset and LLM name in the global configuration.
-            ready_to_retrieve (bool): A flag indicating whether the system is ready for retrieval
-                operations.
-
-        Parameters:
-            global_config: The global configuration object. Defaults to None, leading to initialization
-                of a new BaseConfig object.
-            working_dir: The directory for storing working files. Defaults to None, constructing a default
-                directory based on the class name and timestamp.
-            llm_model_name: LLM model name, can be inserted directly as well as through configuration file.
-            embedding_model_name: Embedding model name, can be inserted directly as well as through configuration file.
-            retrieval_only: Load an existing index without initializing the extraction LLM or OpenIE.
-            llm_base_url: LLM URL for a deployed LLM model, can be inserted directly as well as through configuration file.
-            llm_api_key_env: Environment variable holding the LLM API key for an OpenAI-compatible endpoint.
-            embedding_api_key_env: Environment variable holding the API key for an OpenAI-compatible embedding endpoint.
-        """
-        if global_config is None:
-            self.global_config = BaseConfig()
-        else:
-            self.global_config = global_config
-
-        #Overwriting Configuration if Specified
-        if save_dir is not None:
-            self.global_config.save_dir = save_dir
-
-        if llm_model_name is not None:
-            self.global_config.llm_name = llm_model_name
-
-        if embedding_model_name is not None:
-            self.global_config.embedding_model_name = embedding_model_name
-
-        if llm_base_url is not None:
-            self.global_config.llm_base_url = llm_base_url
-
-        if embedding_base_url is not None:
-            self.global_config.embedding_base_url = embedding_base_url
-
-        if llm_api_key_env is not None:
-            self.global_config.llm_api_key_env = llm_api_key_env
-
-        if embedding_api_key_env is not None:
-            self.global_config.embedding_api_key_env = embedding_api_key_env
-
-        if azure_endpoint is not None:
-            self.global_config.azure_endpoint = azure_endpoint
-
-        if azure_embedding_endpoint is not None:
-            self.global_config.azure_embedding_endpoint = azure_embedding_endpoint
-
-        if azure_api_version is not None:
-            self.global_config.azure_api_version = azure_api_version
-
-        if azure_chat_deployment is not None:
-            self.global_config.azure_chat_deployment = azure_chat_deployment
-
-        if azure_embedding_api_version is not None:
-            self.global_config.azure_embedding_api_version = azure_embedding_api_version
-
-        if azure_embedding_deployment is not None:
-            self.global_config.azure_embedding_deployment = azure_embedding_deployment
-
-        if embedding_provider is not None:
-            self.global_config.embedding_provider = embedding_provider
-
-        self.global_config.validate()
-        if index_identity is not None and (not isinstance(index_identity, str) or not index_identity.strip()):
-            raise ValueError("index_identity must be a non-empty string when provided.")
-        self.index_identity = index_identity
-        self.retrieval_only = retrieval_only
-        if self.retrieval_only and self.global_config.openie_mode == "offline":
-            raise ValueError("retrieval_only requires an online OpenIE mode because offline mode does not initialize embeddings.")
-        injected_index_producer = embedding_model is not None or extraction_llm is not None or text_preprocessor is not None
-        if index_identity is None and injected_index_producer:
-            raise ValueError("index_identity is required when injecting an embedding model, extraction LLM, or text preprocessor.")
-        self.text_preprocessor = text_preprocessor or TextPreprocessor()
-
-        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in redact_config(asdict(self.global_config)).items()])
-        logger.debug(f"HippoRAG init with config:\n  {_print_config}\n")
-
-        #LLM and embedding model specific working directories are created under every specified saving directories
-        llm_label = self.global_config.llm_name.replace("/", "_")
-        embedding_label = self.global_config.embedding_model_name.replace("/", "_")
-        self.working_dir = os.path.join(self.global_config.save_dir, f"{llm_label}_{embedding_label}")
-
-        if not os.path.exists(self.working_dir):
-            logger.info(f"Creating working directory: {self.working_dir}")
-            os.makedirs(self.working_dir, exist_ok=True)
-
-        self._owns_openie = False
-        self._owns_llm_model = False
-        self.extraction_llm = None
-        if self.retrieval_only:
-            self.openie = None
-        elif self.global_config.openie_mode == 'offline':
-            self.extraction_llm = extraction_llm
-            from .information_extraction.openie_vllm_offline import VLLMOfflineOpenIE
-            self.openie = self._construct_or_cleanup(lambda: VLLMOfflineOpenIE(self.global_config))
-            self._owns_openie = True
-        else:
-            self._owns_llm_model = extraction_llm is None
-            self.extraction_llm: BaseLLM = extraction_llm or self._construct_or_cleanup(lambda: _get_llm_class(self.global_config))
-
-        if self.global_config.openie_mode == 'online':
-            self.openie = self._construct_or_cleanup(
-                lambda: OpenIE(
-                    llm_model=self.extraction_llm,
-                    max_workers=self.global_config.openie_max_workers,
-                    ner_max_tokens=self.global_config.openie_ner_max_tokens,
-                    triple_max_tokens=self.global_config.openie_triple_max_tokens,
-                )
+                     global_config=None,
+                     save_dir=None,
+                     llm_model_name=None,
+                     llm_base_url=None,
+                     embedding_model_name=None,
+                     embedding_base_url=None,
+                     azure_endpoint=None,
+                     azure_embedding_endpoint=None,
+                     extraction_llm: BaseLLM = None,
+                     embedding_model: BaseEmbeddingModel = None,
+                     text_preprocessor: BaseTextPreprocessor = None,
+                     azure_api_version=None,
+                     azure_chat_deployment=None,
+                     azure_embedding_api_version=None,
+                     azure_embedding_deployment=None,
+                     index_identity=None,
+                     embedding_provider=None,
+                     llm_api_key_env=None,
+                     embedding_api_key_env=None,
+                     openie_active=False):
+            """
+            Initializes an instance of the class and its related components.
+    
+            Attributes:
+                global_config (BaseConfig): The global configuration settings for the instance. An instance
+                    of BaseConfig is used if no value is provided.
+                saving_dir (str): The directory where specific HippoRAG instances will be stored. This defaults
+                    to `outputs` if no value is provided.
+                llm_model (BaseLLM): The language model used for processing based on the global
+                    configuration settings.
+                openie (Union[OpenIE, VLLMOfflineOpenIE]): The Open Information Extraction module
+                    configured in either online or offline mode based on the global settings.
+                graph: The graph instance initialized by the `initialize_graph` method.
+                embedding_model (BaseEmbeddingModel): The embedding model associated with the current
+                    configuration.
+                chunk_embedding_store (EmbeddingStore): The embedding store handling chunk embeddings.
+                entity_embedding_store (EmbeddingStore): The embedding store handling entity embeddings.
+                fact_embedding_store (EmbeddingStore): The embedding store handling fact embeddings.
+                prompt_template_manager (PromptTemplateManager): The manager for handling prompt templates
+                    and roles mappings.
+                openie_results_path (str): The file path for storing Open Information Extraction results
+                    based on the dataset and LLM name in the global configuration.
+                rerank_filter (Optional[DSPyFilter]): The filter responsible for reranking information
+                    when a rerank file path is specified in the global configuration.
+                ready_to_retrieve (bool): A flag indicating whether the system is ready for retrieval
+                    operations.
+    
+            Parameters:
+                global_config: The global configuration object. Defaults to None, leading to initialization
+                    of a new BaseConfig object.
+                working_dir: The directory for storing working files. Defaults to None, constructing a default
+                    directory based on the class name and timestamp.
+                llm_model_name: LLM model name, can be inserted directly as well as through configuration file.
+                embedding_model_name: Embedding model name, can be inserted directly as well as through configuration file.
+                llm_base_url: LLM URL for a deployed LLM model, can be inserted directly as well as through configuration file.
+                llm_api_key_env: Environment variable holding the LLM API key for an OpenAI-compatible endpoint.
+                embedding_api_key_env: Environment variable holding the API key for an OpenAI-compatible embedding endpoint.
+            """
+            if global_config is None:
+                self.global_config = BaseConfig()
+            else:
+                self.global_config = global_config
+    
+            #Overwriting Configuration if Specified
+            if save_dir is not None:
+                self.global_config.save_dir = save_dir
+    
+            if llm_model_name is not None:
+                self.global_config.llm_name = llm_model_name
+    
+            if embedding_model_name is not None:
+                self.global_config.embedding_model_name = embedding_model_name
+    
+            if llm_base_url is not None:
+                self.global_config.llm_base_url = llm_base_url
+    
+            if embedding_base_url is not None:
+                self.global_config.embedding_base_url = embedding_base_url
+    
+            if llm_api_key_env is not None:
+                self.global_config.llm_api_key_env = llm_api_key_env
+    
+            if embedding_api_key_env is not None:
+                self.global_config.embedding_api_key_env = embedding_api_key_env
+    
+            if azure_endpoint is not None:
+                self.global_config.azure_endpoint = azure_endpoint
+    
+            if azure_embedding_endpoint is not None:
+                self.global_config.azure_embedding_endpoint = azure_embedding_endpoint
+    
+            if azure_api_version is not None:
+                self.global_config.azure_api_version = azure_api_version
+    
+            if azure_chat_deployment is not None:
+                self.global_config.azure_chat_deployment = azure_chat_deployment
+    
+            if azure_embedding_api_version is not None:
+                self.global_config.azure_embedding_api_version = azure_embedding_api_version
+    
+            if azure_embedding_deployment is not None:
+                self.global_config.azure_embedding_deployment = azure_embedding_deployment
+    
+            if embedding_provider is not None:
+                self.global_config.embedding_provider = embedding_provider
+    
+            self.global_config.validate()
+            if index_identity is not None and (not isinstance(index_identity, str) or not index_identity.strip()):
+                raise ValueError("index_identity must be a non-empty string when provided.")
+            self.index_identity = index_identity
+            injected_index_producer = embedding_model is not None or extraction_llm is not None or text_preprocessor is not None
+            if index_identity is None and injected_index_producer:
+                raise ValueError("index_identity is required when injecting an embedding model, extraction LLM, or text preprocessor.")
+            self.text_preprocessor = text_preprocessor or TextPreprocessor()
+    
+            _print_config = ",\n  ".join([f"{k} = {v}" for k, v in redact_config(asdict(self.global_config)).items()])
+            logger.debug(f"HippoRAG init with config:\n  {_print_config}\n")
+    
+            #LLM and embedding model specific working directories are created under every specified saving directories
+            llm_label = self.global_config.llm_name.replace("/", "_")
+            embedding_label = self.global_config.embedding_model_name.replace("/", "_")
+            self.working_dir = os.path.join(self.global_config.save_dir, f"{llm_label}_{embedding_label}")
+    
+            if not os.path.exists(self.working_dir):
+                logger.info(f"Creating working directory: {self.working_dir}")
+                os.makedirs(self.working_dir, exist_ok=True)
+    
+            self._owns_openie = False
+            self._disable_openie_after_preprocess = (
+                not openie_active and self.global_config.openie_mode != "online"
             )
-            self._owns_openie = True
-        elif self.global_config.openie_mode == 'Transformers-offline':
-            from .information_extraction.openie_transformers_offline import TransformersOfflineOpenIE
-            self.openie = self._construct_or_cleanup(lambda: TransformersOfflineOpenIE(self.global_config, shared_llm=self.extraction_llm))
-            self._owns_openie = True
-        elif self.global_config.openie_mode != 'offline':
-            raise ValueError(f"Unsupported openie_mode: {self.global_config.openie_mode}")
-
-        self.graph = self._construct_or_cleanup(self.initialize_graph)
-
-        if self.global_config.openie_mode == 'offline':
-            self.embedding_model = None
-            self._owns_embedding_model = False
-        else:
+            # OpenIE must remain available while pre_openie is running. The
+            # requested flag controls its lifecycle after extraction.
+            self.openie_active = True
+            self._owns_llm_model = extraction_llm is None if self.global_config.openie_mode != 'offline' else False
+            self.extraction_llm: BaseLLM = extraction_llm or self._construct_or_cleanup(lambda: _get_llm_class(self.global_config))
+                
+            if self.global_config.openie_mode == 'offline':
+                from .information_extraction.openie_vllm_offline import VLLMOfflineOpenIE
+                self.openie = self._construct_or_cleanup(lambda: VLLMOfflineOpenIE(self.global_config))
+                self._owns_openie = True
+            elif self.global_config.openie_mode == 'online':
+                self.openie = self._construct_or_cleanup(
+                    lambda: OpenIE(
+                        llm_model=self.extraction_llm,
+                        max_workers=self.global_config.openie_max_workers,
+                        ner_max_tokens=self.global_config.openie_ner_max_tokens,
+                        triple_max_tokens=self.global_config.openie_triple_max_tokens,
+                    )
+                )
+                self._owns_openie = True
+            elif self.global_config.openie_mode == 'Transformers-offline':
+                from .information_extraction.openie_transformers_offline import TransformersOfflineOpenIE
+                self.openie = self._construct_or_cleanup(lambda: TransformersOfflineOpenIE(self.global_config, shared_llm=self.extraction_llm))
+                self._owns_openie = True
+            else:
+                raise ValueError(f"Unsupported openie_mode: {self.global_config.openie_mode}")
+    
+            self.graph = self._construct_or_cleanup(self.initialize_graph)
+    
             self._owns_embedding_model = embedding_model is None
             self.embedding_model: BaseEmbeddingModel = embedding_model or self._construct_or_cleanup(
                 lambda: _get_embedding_model_class(
@@ -250,54 +248,53 @@ class HippoRAG:
                     embedding_model_name=self.global_config.embedding_model_name,
                 )
             )
-        self.chunk_embedding_store = self._construct_or_cleanup(
-            lambda: get_embedding_store(
-                self.embedding_model,
-                os.path.join(self.working_dir, "chunk_embeddings"),
-                self.global_config.embedding_batch_size,
-                'chunk',
-                self.global_config,
+            self.chunk_embedding_store = self._construct_or_cleanup(
+                lambda: get_embedding_store(
+                    self.embedding_model,
+                    os.path.join(self.working_dir, "chunk_embeddings"),
+                    self.global_config.embedding_batch_size,
+                    'chunk',
+                    self.global_config,
+                )
             )
-        )
-        self.entity_embedding_store = self._construct_or_cleanup(
-            lambda: get_embedding_store(
-                self.embedding_model,
-                os.path.join(self.working_dir, "entity_embeddings"),
-                self.global_config.embedding_batch_size,
-                'entity',
-                self.global_config,
+            self.entity_embedding_store = self._construct_or_cleanup(
+                lambda: get_embedding_store(
+                    self.embedding_model,
+                    os.path.join(self.working_dir, "entity_embeddings"),
+                    self.global_config.embedding_batch_size,
+                    'entity',
+                    self.global_config,
+                )
             )
-        )
-        self.fact_embedding_store = self._construct_or_cleanup(
-            lambda: get_embedding_store(
-                self.embedding_model,
-                os.path.join(self.working_dir, "fact_embeddings"),
-                self.global_config.embedding_batch_size,
-                'fact',
-                self.global_config,
+            self.fact_embedding_store = self._construct_or_cleanup(
+                lambda: get_embedding_store(
+                    self.embedding_model,
+                    os.path.join(self.working_dir, "fact_embeddings"),
+                    self.global_config.embedding_batch_size,
+                    'fact',
+                    self.global_config,
+                )
             )
-        )
-        self.index_manifest_path = os.path.join(self.working_dir, "index_manifest.json")
-        self.openie_results_path = os.path.join(self.global_config.save_dir,f'openie_results_ner_{self.global_config.llm_name.replace("/", "_")}.json')
-        self.openie_state_path = os.path.join(self.working_dir, "openie_state.json")
-        self.chunk_metadata_path = os.path.join(self.working_dir, "chunk_metadata.json")
-        if self.global_config.openie_mode != 'offline':
-            try:
-                self._validate_or_create_index_manifest()
-            except Exception:
-                self.close()
-                raise
-
-        self.ready_to_retrieve = False
-
-        self.ppr_time = 0
-        self.rerank_time = 0
-        self.all_retrieval_time = 0
-
-        self.ent_node_to_chunk_ids = None
-        self._openie_info = None
-        self._openie_provenance = None
-        self.chunk_metadata = self._construct_or_cleanup(self._load_chunk_metadata)
+            self.index_manifest_path = os.path.join(self.working_dir, "index_manifest.json")
+            self.openie_results_path = os.path.join(self.global_config.save_dir,f'openie_results_ner_{self.global_config.llm_name.replace("/", "_")}.json')
+            self.openie_state_path = os.path.join(self.working_dir, "openie_state.json")
+            self.chunk_metadata_path = os.path.join(self.working_dir, "chunk_metadata.json")
+            if self.global_config.openie_mode != 'offline':
+                try:
+                    self._validate_or_create_index_manifest()
+                except Exception:
+                    self.close()
+                    raise
+                    
+            self.ready_to_retrieve = False
+            self.ppr_time = 0
+            self.rerank_time = 0
+            self.all_retrieval_time = 0
+    
+            self.ent_node_to_chunk_ids = None
+            self._openie_info = None
+            self._openie_provenance = None
+            self.chunk_metadata = self._construct_or_cleanup(self._load_chunk_metadata)
 
     def _validate_or_create_index_manifest(self) -> None:
         manifest = {
@@ -307,15 +304,11 @@ class HippoRAG:
             "embedding": embedding_index_identity(self.global_config),
             "components": {
                 "embedding_model": component_class_identity(self.embedding_model) if self.embedding_model is not None else None,
-                "extraction_llm": (
-                    self._stored_extraction_llm_identity()
-                    if self.retrieval_only
-                    else component_class_identity(self.extraction_llm)
-                ),
+                "extraction_llm": component_class_identity(self.extraction_llm),
                 "text_preprocessor": component_class_identity(self.text_preprocessor),
                 "explicit_identity": self.index_identity,
             },
-            "openie": self._stored_openie_provenance() if self.retrieval_only else self._openie_provenance_for_manifest(),
+            "openie": self._openie_provenance_for_manifest(),
             "graph_construction": {
                 "synonymy_edge_topk": self.global_config.synonymy_edge_topk,
                 "synonymy_edge_sim_threshold": self.global_config.synonymy_edge_sim_threshold,
@@ -332,37 +325,6 @@ class HippoRAG:
             ),
             allow_empty_rewrite=self.global_config.force_openie_from_scratch,
         )
-
-    def _stored_extraction_llm_identity(self) -> Optional[str]:
-        if not self.retrieval_only:
-            return component_class_identity(self.extraction_llm)
-        if not os.path.isfile(self.index_manifest_path):
-            raise StateConsistencyError(
-                f"retrieval_only requires an existing index manifest at {self.index_manifest_path}."
-            )
-        try:
-            with open(self.index_manifest_path, encoding="utf-8") as manifest_file:
-                manifest = json.load(manifest_file)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise StateConsistencyError(f"Cannot read index manifest {self.index_manifest_path}: {exc}") from exc
-        return manifest.get("components", {}).get("extraction_llm")
-
-    def _stored_openie_provenance(self) -> Dict[str, Any]:
-        if not self.retrieval_only:
-            return self._openie_provenance_for_manifest()
-        if not os.path.isfile(self.index_manifest_path):
-            raise StateConsistencyError(
-                f"retrieval_only requires an existing index manifest at {self.index_manifest_path}."
-            )
-        try:
-            with open(self.index_manifest_path, encoding="utf-8") as manifest_file:
-                manifest = json.load(manifest_file)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise StateConsistencyError(f"Cannot read index manifest {self.index_manifest_path}: {exc}") from exc
-        provenance = manifest.get("openie")
-        if not isinstance(provenance, dict):
-            raise StateConsistencyError(f"Invalid OpenIE provenance in {self.index_manifest_path}.")
-        return provenance
 
     def _openie_state_identity(self) -> Dict[str, Any]:
         return {
@@ -410,8 +372,6 @@ class HippoRAG:
     def _validate_openie_provenance(self, provenance: Any, source_path: str) -> Dict[str, Any]:
         if not isinstance(provenance, dict) or provenance.get("identity") != self._openie_state_identity():
             raise StateConsistencyError(f"OpenIE provenance is missing or incompatible in {source_path}. Use a fresh save_dir or force a full re-extraction before building derived state.")
-        if self.retrieval_only:
-            return provenance
         stored_producer = provenance.get("producer")
         current_producer = self._current_openie_provenance()["producer"]
         phase_transition = isinstance(stored_producer, dict) and stored_producer.get("mode") == "offline" and current_producer["mode"] == "online"
@@ -453,7 +413,6 @@ class HippoRAG:
         if not all(isinstance(chunk, Chunk) for chunk in chunks):
             raise TypeError("Text preprocessors must return a list of Chunk instances.")
         return chunks
-
 
     def initialize_graph(self):
         """
@@ -510,14 +469,34 @@ class HippoRAG:
         new_openie_rows = {k : chunks[k] for k in chunk_keys_to_process}
 
         if len(chunk_keys_to_process) > 0:
+            if not self.openie_active:
+                raise RuntimeError("OpenIE is disabled and the requested chunks have no stored extraction results.")
             new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
             self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
 
         self._openie_info = all_openie_info
         self._save_openie_state(all_openie_info)
 
-        raise RuntimeError("Offline OpenIE completed. Run indexing again with openie_mode='online' to build the graph.")
+        if self._disable_openie_after_preprocess:
+            self._disable_openie()
+            logger.info("Offline OpenIE completed. OpenIE resources have been released.")
 
+    def _disable_openie(self) -> None:
+        """Release OpenIE resources after extraction while retaining results."""
+        openie = getattr(self, "openie", None)
+        if openie is not None:
+            disable = getattr(openie, "disable", None)
+            if callable(disable):
+                disable()
+            else:
+                close = getattr(openie, "close", None)
+                if callable(close):
+                    close()
+            for attribute in ("llm_model", "prompt_template_manager"):
+                if hasattr(openie, attribute):
+                    setattr(openie, attribute, None)
+        self.openie_active = False
+    
     def index(self, docs: List[Union[str, Chunk]]):
         """
         Indexes the given documents based on the HippoRAG 2 framework which generates an OpenIE knowledge graph
@@ -547,7 +526,7 @@ class HippoRAG:
         processed_chunks = self._preprocess_docs(docs)
         chunk_texts = [chunk.content for chunk in processed_chunks]
 
-        if self.global_config.openie_mode == 'offline':
+        if self.global_config.openie_mode != 'online':
             self.pre_openie(processed_chunks)
 
         self.chunk_embedding_store.insert_strings(chunk_texts)
@@ -567,7 +546,12 @@ class HippoRAG:
             chunk_to_rows.keys(), force_reextract=self.global_config.force_openie_from_scratch)
         new_openie_rows = {k : chunk_to_rows[k] for k in chunk_keys_to_process}
 
-        if len(chunk_keys_to_process) > 0:
+        if len(chunk_keys_to_process) > 0 and self.global_config.openie_mode != 'online':
+            if not self.openie_active:
+                raise RuntimeError(
+                    "OpenIE is disabled and the index contains chunks without stored extraction results. "
+                    "Run pre_openie first or enable OpenIE for this indexing pass."
+                )
             new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
             self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
 

@@ -7,12 +7,14 @@ from ..utils.misc_utils import NerRawOutput, TripleRawOutput
 from ..utils.logging_utils import get_logger
 from ..prompts import PromptTemplateManager
 from ..llm.unsloth_offline import UnslothOffline
+from .base import BaseOpenIE
 
 logger = get_logger(__name__)
 
 
 class UnslothOfflineOpenIE(OpenIE):
-    def __init__(self, global_config, shared_llm=None):
+    def __init__(self, global_config, shared_llm=None, active: bool = True):
+        BaseOpenIE.__init__(self, active=active)
 
         self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
         self.llm_model = UnslothOffline(global_config, model=getattr(shared_llm, "model", None), tokenizer=getattr(shared_llm, "tokenizer", None))
@@ -30,6 +32,7 @@ class UnslothOfflineOpenIE(OpenIE):
         self.llm_model = None
 
     def batch_openie(self, chunks: Dict[str, ChunkInfo]) -> Tuple[Dict[str, NerRawOutput], Dict[str, TripleRawOutput]]:
+        self._require_active()
         """
         Conduct batch OpenIE synchronously using vLLM offline batch mode, including NER and triple extraction
 

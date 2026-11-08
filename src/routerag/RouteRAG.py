@@ -103,7 +103,8 @@ class RouteRAG:
                  index_identity=None,
                  embedding_provider=None,
                  llm_api_key_env=None,
-                 embedding_api_key_env=None):
+                 embedding_api_key_env=None,
+                 openie_active: bool = True):
         """
         Initializes an instance of the class and its related components.
 
@@ -212,19 +213,21 @@ class RouteRAG:
             os.makedirs(self.working_dir, exist_ok=True)
 
         self._owns_openie = False
-        if self.global_config.openie_mode == 'offline':
-            self._owns_llm_model = False
-            self.llm_model = extraction_llm
+        self.openie_active = openie_active
+        self._owns_llm_model = False
+        self.llm_model = extraction_llm
+        self.extraction_llm = extraction_llm
+        if self.global_config.openie_mode == 'offline' and self.openie_active:
             self.extraction_llm = extraction_llm or self.llm_model
             from .information_extraction.openie_vllm_offline import VLLMOfflineOpenIE
             self.openie = self._construct_or_cleanup(lambda: VLLMOfflineOpenIE(self.global_config))
             self._owns_openie = True
-        else:
+        elif self.global_config.openie_mode == 'online' and self.openie_active:
             self._owns_llm_model = extraction_llm is None
             self.llm_model: BaseLLM = extraction_llm  or self._construct_or_cleanup(lambda: _get_llm_class(self.global_config))
             self.extraction_llm: BaseLLM = extraction_llm or self.llm_model
 
-        if self.global_config.openie_mode == 'online':
+        if self.global_config.openie_mode == 'online' and self.openie_active:
             self.openie = self._construct_or_cleanup(
                 lambda: OpenIE(
                     llm_model=self.extraction_llm,
@@ -234,33 +237,29 @@ class RouteRAG:
                 )
             )
             self._owns_openie = True
-        elif self.global_config.openie_mode == 'Transformers-offline':
+        elif self.global_config.openie_mode == 'Transformers-offline' and self.openie_active:
             from .information_extraction.openie_transformers_offline import TransformersOfflineOpenIE
             self.openie = self._construct_or_cleanup(lambda: TransformersOfflineOpenIE(self.global_config, shared_llm=self.extraction_llm))
             self._owns_openie = True
-        elif self.global_config.openie_mode == 'Unsloth-offline':
+        elif self.global_config.openie_mode == 'Unsloth-offline' and self.openie_active:
             from .information_extraction.openie_unsloth import UnslothOfflineOpenIE
             self.openie = self._construct_or_cleanup(lambda: UnslothOfflineOpenIE(self.global_config, shared_llm=self.extraction_llm))
             self._owns_openie = True
-        elif self.global_config.openie_mode != 'offline':
+        elif self.global_config.openie_mode not in ('offline', 'online', 'Transformers-offline', 'Unsloth-offline'):
             raise ValueError(f"Unsupported openie_mode: {self.global_config.openie_mode}")
 
         self.graph = self._construct_or_cleanup(self.initialize_graph)
 
-        if self.global_config.openie_mode == 'offline':
-            self.embedding_model = None
-            self._owns_embedding_model = False
-        else:
-            self._owns_embedding_model = embedding_model is None
-            self.embedding_model: BaseEmbeddingModel = embedding_model or self._construct_or_cleanup(
-                lambda: _get_embedding_model_class(
-                    embedding_model_name=self.global_config.embedding_model_name,
-                    provider=self.global_config.embedding_provider,
-                )(
-                    global_config=self.global_config,
-                    embedding_model_name=self.global_config.embedding_model_name,
-                )
+        self._owns_embedding_model = embedding_model is None
+        self.embedding_model: BaseEmbeddingModel = embedding_model or self._construct_or_cleanup(
+            lambda: _get_embedding_model_class(
+                embedding_model_name=self.global_config.embedding_model_name,
+                provider=self.global_config.embedding_provider,
+            )(
+                global_config=self.global_config,
+                embedding_model_name=self.global_config.embedding_model_name,
             )
+        )
         self.chunk_embedding_store = self._construct_or_cleanup(
             lambda: get_embedding_store(
                 self.embedding_model,
@@ -301,7 +300,11 @@ class RouteRAG:
 
         self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
 
-        self.rerank_filter = None if self.global_config.openie_mode == 'offline' else self._construct_or_cleanup(lambda: DSPyFilter(self))
+        self.rerank_filter = (
+            None
+            if self.global_config.openie_mode == 'offline' or not self.openie_active
+            else self._construct_or_cleanup(lambda: DSPyFilter(self))
+        )
 
         self.ready_to_retrieve = False
 
@@ -488,13 +491,31 @@ class RouteRAG:
         new_openie_rows = {k : chunks[k] for k in chunk_keys_to_process}
 
         if len(chunk_keys_to_process) > 0:
+            if not self.openie_active:
+                raise RuntimeError("OpenIE is disabled and the requested chunks have no stored extraction results.")
             new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
             self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
 
         self._openie_info = all_openie_info
         self._save_openie_state(all_openie_info)
 
-        raise RuntimeError("Offline OpenIE completed. Run indexing again with openie_mode='online' to build the graph.")
+        self._disable_openie()
+        logger.info("Offline OpenIE completed. OpenIE resources have been released.")
+
+    def _disable_openie(self) -> None:
+        """Disable OpenIE after extraction while retaining persisted results."""
+        if not self.openie_active:
+            return
+        openie = getattr(self, "openie", None)
+        if openie is not None:
+            disable = getattr(openie, "disable", None)
+            if callable(disable):
+                disable()
+            else:
+                close = getattr(openie, "close", None)
+                if callable(close):
+                    close()
+        self.openie_active = False
 
     def index(self, docs: List[Union[str, Chunk]]):
         """
@@ -546,6 +567,11 @@ class RouteRAG:
         new_openie_rows = {k : chunk_to_rows[k] for k in chunk_keys_to_process}
 
         if len(chunk_keys_to_process) > 0:
+            if not self.openie_active:
+                raise RuntimeError(
+                    "OpenIE is disabled and the index contains chunks without stored extraction results. "
+                    "Run pre_openie first or enable OpenIE for this indexing pass."
+                )
             new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
             self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
 

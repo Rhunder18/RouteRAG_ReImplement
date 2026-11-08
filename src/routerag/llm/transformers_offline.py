@@ -40,6 +40,11 @@ class TransformersOffline:
         self.model_name = model_name
         self.model = kwargs.get("model") or AutoModelForCausalLM.from_pretrained(model_name, device_map='auto', torch_dtype=torch.bfloat16)
         self.tokenizer = kwargs.get("tokenizer") or AutoTokenizer.from_pretrained(model_name)
+        if not getattr(self.model.config, "is_encoder_decoder", False):
+            if self.tokenizer.padding_side != "left":
+                self.tokenizer.padding_side = "left"
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
         
         if cache_filename is None:
             cache_filename = f'{model_name.replace("/", "_")}_cache.sqlite'

@@ -543,7 +543,11 @@ class HippoRAG:
         chunk_to_rows = self.chunk_embedding_store.get_all_id_to_rows()
 
         all_openie_info, chunk_keys_to_process = self.load_existing_openie(
-            chunk_to_rows.keys(), force_reextract=self.global_config.force_openie_from_scratch)
+            chunk_to_rows.keys(),
+            force_reextract=(
+                self.global_config.force_openie_from_scratch
+                and self.global_config.openie_mode == 'online'
+            ))
         new_openie_rows = {k : chunk_to_rows[k] for k in chunk_keys_to_process}
 
         if len(chunk_keys_to_process) > 0 and self.global_config.openie_mode != 'online':

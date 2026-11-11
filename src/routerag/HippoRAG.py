@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import logging
@@ -12,17 +13,21 @@ from filelock import FileLock
 
 from .llm import _get_llm_class, BaseLLM, find_gateway
 from .embedding_model import _get_embedding_model_class, BaseEmbeddingModel
-from .embedding_store import get_embedding_store
+from .embedding_store import EmbeddingStore, get_embedding_store
 from .information_extraction import OpenIE
 # VLLMOfflineOpenIE and TransformersOfflineOpenIE are imported lazily inside
 # __init__ so that vllm (Linux-only) and heavy Transformers deps are never
 # loaded unless the user explicitly requests offline OpenIE mode.
 from .evaluation.retrieval_eval import RetrievalRecall
+from .evaluation.qa_eval import QAExactMatch, QAF1Score
 from .prompts.linking import get_query_instruction
+from .prompts.prompt_template_manager import PromptTemplateManager
+from .rerank import DSPyFilter
 from .utils.misc_utils import (
     Chunk,
     NerRawOutput,
     QuerySolution,
+    RetrievalResult,
     TripleRawOutput,
     compute_mdhash_id,
     ensure_list_input,
@@ -31,11 +36,14 @@ from .utils.misc_utils import (
     min_max_normalize,
     reformat_openie_results,
     text_processing,
+    validate_parallel_input_lengths,
 )
 from .preprocessing import BaseTextPreprocessor, TextPreprocessor
 from .utils.embed_utils import retrieve_knn
+from .utils.typing import Triple
 from .utils.config_utils import BaseConfig
 from .utils.state_utils import StateConsistencyError, component_class_identity, embedding_index_identity, remove_sources_from_mapping, validate_or_create_index_manifest
+from .utils.qa_utils import reason_step
 from .utils.logging_utils import redact_config
 
 logger = logging.getLogger(__name__)
@@ -59,7 +67,7 @@ class HippoRAG:
         if getattr(self, "_owns_openie", False):
             resources.append(getattr(self, "openie", None))
         if getattr(self, "_owns_llm_model", False):
-            resources.append(getattr(self, "extraction_llm", None))
+            resources.append(getattr(self, "llm_model", None))
         closed_ids = getattr(self, "_closed_resource_ids", set())
         for resource in resources:
             if resource is None or id(resource) in closed_ids:
@@ -78,166 +86,171 @@ class HippoRAG:
             raise
 
     def __init__(self,
-                     global_config=None,
-                     save_dir=None,
-                     llm_model_name=None,
-                     llm_base_url=None,
-                     embedding_model_name=None,
-                     embedding_base_url=None,
-                     azure_endpoint=None,
-                     azure_embedding_endpoint=None,
-                     extraction_llm: BaseLLM = None,
-                     embedding_model: BaseEmbeddingModel = None,
-                     text_preprocessor: BaseTextPreprocessor = None,
-                     azure_api_version=None,
-                     azure_chat_deployment=None,
-                     azure_embedding_api_version=None,
-                     azure_embedding_deployment=None,
-                     index_identity=None,
-                     embedding_provider=None,
-                     llm_api_key_env=None,
-                     embedding_api_key_env=None,
-                     openie_active=False):
-            """
-            Initializes an instance of the class and its related components.
-    
-            Attributes:
-                global_config (BaseConfig): The global configuration settings for the instance. An instance
-                    of BaseConfig is used if no value is provided.
-                saving_dir (str): The directory where specific HippoRAG instances will be stored. This defaults
-                    to `outputs` if no value is provided.
-                llm_model (BaseLLM): The language model used for processing based on the global
-                    configuration settings.
-                openie (Union[OpenIE, VLLMOfflineOpenIE]): The Open Information Extraction module
-                    configured in either online or offline mode based on the global settings.
-                graph: The graph instance initialized by the `initialize_graph` method.
-                embedding_model (BaseEmbeddingModel): The embedding model associated with the current
-                    configuration.
-                chunk_embedding_store (EmbeddingStore): The embedding store handling chunk embeddings.
-                entity_embedding_store (EmbeddingStore): The embedding store handling entity embeddings.
-                fact_embedding_store (EmbeddingStore): The embedding store handling fact embeddings.
-                prompt_template_manager (PromptTemplateManager): The manager for handling prompt templates
-                    and roles mappings.
-                openie_results_path (str): The file path for storing Open Information Extraction results
-                    based on the dataset and LLM name in the global configuration.
-                rerank_filter (Optional[DSPyFilter]): The filter responsible for reranking information
-                    when a rerank file path is specified in the global configuration.
-                ready_to_retrieve (bool): A flag indicating whether the system is ready for retrieval
-                    operations.
-    
-            Parameters:
-                global_config: The global configuration object. Defaults to None, leading to initialization
-                    of a new BaseConfig object.
-                working_dir: The directory for storing working files. Defaults to None, constructing a default
-                    directory based on the class name and timestamp.
-                llm_model_name: LLM model name, can be inserted directly as well as through configuration file.
-                embedding_model_name: Embedding model name, can be inserted directly as well as through configuration file.
-                llm_base_url: LLM URL for a deployed LLM model, can be inserted directly as well as through configuration file.
-                llm_api_key_env: Environment variable holding the LLM API key for an OpenAI-compatible endpoint.
-                embedding_api_key_env: Environment variable holding the API key for an OpenAI-compatible embedding endpoint.
-            """
-            if global_config is None:
-                self.global_config = BaseConfig()
-            else:
-                self.global_config = global_config
-    
-            #Overwriting Configuration if Specified
-            if save_dir is not None:
-                self.global_config.save_dir = save_dir
-    
-            if llm_model_name is not None:
-                self.global_config.llm_name = llm_model_name
-    
-            if embedding_model_name is not None:
-                self.global_config.embedding_model_name = embedding_model_name
-    
-            if llm_base_url is not None:
-                self.global_config.llm_base_url = llm_base_url
-    
-            if embedding_base_url is not None:
-                self.global_config.embedding_base_url = embedding_base_url
-    
-            if llm_api_key_env is not None:
-                self.global_config.llm_api_key_env = llm_api_key_env
-    
-            if embedding_api_key_env is not None:
-                self.global_config.embedding_api_key_env = embedding_api_key_env
-    
-            if azure_endpoint is not None:
-                self.global_config.azure_endpoint = azure_endpoint
-    
-            if azure_embedding_endpoint is not None:
-                self.global_config.azure_embedding_endpoint = azure_embedding_endpoint
-    
-            if azure_api_version is not None:
-                self.global_config.azure_api_version = azure_api_version
-    
-            if azure_chat_deployment is not None:
-                self.global_config.azure_chat_deployment = azure_chat_deployment
-    
-            if azure_embedding_api_version is not None:
-                self.global_config.azure_embedding_api_version = azure_embedding_api_version
-    
-            if azure_embedding_deployment is not None:
-                self.global_config.azure_embedding_deployment = azure_embedding_deployment
-    
-            if embedding_provider is not None:
-                self.global_config.embedding_provider = embedding_provider
-    
-            self.global_config.validate()
-            if index_identity is not None and (not isinstance(index_identity, str) or not index_identity.strip()):
-                raise ValueError("index_identity must be a non-empty string when provided.")
-            self.index_identity = index_identity
-            injected_index_producer = embedding_model is not None or extraction_llm is not None or text_preprocessor is not None
-            if index_identity is None and injected_index_producer:
-                raise ValueError("index_identity is required when injecting an embedding model, extraction LLM, or text preprocessor.")
-            self.text_preprocessor = text_preprocessor or TextPreprocessor()
-    
-            _print_config = ",\n  ".join([f"{k} = {v}" for k, v in redact_config(asdict(self.global_config)).items()])
-            logger.debug(f"HippoRAG init with config:\n  {_print_config}\n")
-    
-            #LLM and embedding model specific working directories are created under every specified saving directories
-            llm_label = self.global_config.llm_name.replace("/", "_")
-            embedding_label = self.global_config.embedding_model_name.replace("/", "_")
-            self.working_dir = os.path.join(self.global_config.save_dir, f"{llm_label}_{embedding_label}")
-    
-            if not os.path.exists(self.working_dir):
-                logger.info(f"Creating working directory: {self.working_dir}")
-                os.makedirs(self.working_dir, exist_ok=True)
-    
-            self._owns_openie = False
-            self._disable_openie_after_preprocess = (
-                not openie_active and self.global_config.openie_mode != "online"
-            )
-            # OpenIE must remain available while pre_openie is running. The
-            # requested flag controls its lifecycle after extraction.
-            self.openie_active = True
-            self._owns_llm_model = extraction_llm is None if self.global_config.openie_mode != 'offline' else False
-            self.extraction_llm: BaseLLM = extraction_llm or self._construct_or_cleanup(lambda: _get_llm_class(self.global_config))
-                
-            if self.global_config.openie_mode == 'offline':
-                from .information_extraction.openie_vllm_offline import VLLMOfflineOpenIE
-                self.openie = self._construct_or_cleanup(lambda: VLLMOfflineOpenIE(self.global_config))
-                self._owns_openie = True
-            elif self.global_config.openie_mode == 'online':
-                self.openie = self._construct_or_cleanup(
-                    lambda: OpenIE(
-                        llm_model=self.extraction_llm,
-                        max_workers=self.global_config.openie_max_workers,
-                        ner_max_tokens=self.global_config.openie_ner_max_tokens,
-                        triple_max_tokens=self.global_config.openie_triple_max_tokens,
-                    )
+                 global_config=None,
+                 save_dir=None,
+                 llm_model_name=None,
+                 llm_base_url=None,
+                 embedding_model_name=None,
+                 embedding_base_url=None,
+                 azure_endpoint=None,
+                 azure_embedding_endpoint=None,
+                 extraction_llm: BaseLLM = None,
+                 qa_llm: BaseLLM = None,
+                 embedding_model: BaseEmbeddingModel = None,
+                 text_preprocessor: BaseTextPreprocessor = None,
+                 azure_api_version=None,
+                 azure_chat_deployment=None,
+                 azure_embedding_api_version=None,
+                 azure_embedding_deployment=None,
+                 index_identity=None,
+                 embedding_provider=None,
+                 llm_api_key_env=None,
+                 embedding_api_key_env=None):
+        """
+        Initializes an instance of the class and its related components.
+
+        Attributes:
+            global_config (BaseConfig): The global configuration settings for the instance. An instance
+                of BaseConfig is used if no value is provided.
+            saving_dir (str): The directory where specific HippoRAG instances will be stored. This defaults
+                to `outputs` if no value is provided.
+            llm_model (BaseLLM): The language model used for processing based on the global
+                configuration settings.
+            openie (Union[OpenIE, VLLMOfflineOpenIE]): The Open Information Extraction module
+                configured in either online or offline mode based on the global settings.
+            graph: The graph instance initialized by the `initialize_graph` method.
+            embedding_model (BaseEmbeddingModel): The embedding model associated with the current
+                configuration.
+            chunk_embedding_store (EmbeddingStore): The embedding store handling chunk embeddings.
+            entity_embedding_store (EmbeddingStore): The embedding store handling entity embeddings.
+            fact_embedding_store (EmbeddingStore): The embedding store handling fact embeddings.
+            prompt_template_manager (PromptTemplateManager): The manager for handling prompt templates
+                and roles mappings.
+            openie_results_path (str): The file path for storing Open Information Extraction results
+                based on the dataset and LLM name in the global configuration.
+            rerank_filter (Optional[DSPyFilter]): The filter responsible for reranking information
+                when a rerank file path is specified in the global configuration.
+            ready_to_retrieve (bool): A flag indicating whether the system is ready for retrieval
+                operations.
+
+        Parameters:
+            global_config: The global configuration object. Defaults to None, leading to initialization
+                of a new BaseConfig object.
+            working_dir: The directory for storing working files. Defaults to None, constructing a default
+                directory based on the class name and timestamp.
+            llm_model_name: LLM model name, can be inserted directly as well as through configuration file.
+            embedding_model_name: Embedding model name, can be inserted directly as well as through configuration file.
+            llm_base_url: LLM URL for a deployed LLM model, can be inserted directly as well as through configuration file.
+            llm_api_key_env: Environment variable holding the LLM API key for an OpenAI-compatible endpoint.
+            embedding_api_key_env: Environment variable holding the API key for an OpenAI-compatible embedding endpoint.
+        """
+        if global_config is None:
+            self.global_config = BaseConfig()
+        else:
+            self.global_config = global_config
+
+        #Overwriting Configuration if Specified
+        if save_dir is not None:
+            self.global_config.save_dir = save_dir
+
+        if llm_model_name is not None:
+            self.global_config.llm_name = llm_model_name
+
+        if embedding_model_name is not None:
+            self.global_config.embedding_model_name = embedding_model_name
+
+        if llm_base_url is not None:
+            self.global_config.llm_base_url = llm_base_url
+
+        if embedding_base_url is not None:
+            self.global_config.embedding_base_url = embedding_base_url
+
+        if llm_api_key_env is not None:
+            self.global_config.llm_api_key_env = llm_api_key_env
+
+        if embedding_api_key_env is not None:
+            self.global_config.embedding_api_key_env = embedding_api_key_env
+
+        if azure_endpoint is not None:
+            self.global_config.azure_endpoint = azure_endpoint
+
+        if azure_embedding_endpoint is not None:
+            self.global_config.azure_embedding_endpoint = azure_embedding_endpoint
+
+        if azure_api_version is not None:
+            self.global_config.azure_api_version = azure_api_version
+
+        if azure_chat_deployment is not None:
+            self.global_config.azure_chat_deployment = azure_chat_deployment
+
+        if azure_embedding_api_version is not None:
+            self.global_config.azure_embedding_api_version = azure_embedding_api_version
+
+        if azure_embedding_deployment is not None:
+            self.global_config.azure_embedding_deployment = azure_embedding_deployment
+
+        if embedding_provider is not None:
+            self.global_config.embedding_provider = embedding_provider
+
+        self.global_config.validate()
+        if index_identity is not None and (not isinstance(index_identity, str) or not index_identity.strip()):
+            raise ValueError("index_identity must be a non-empty string when provided.")
+        self.index_identity = index_identity
+        injected_index_producer = embedding_model is not None or extraction_llm is not None or text_preprocessor is not None or (qa_llm is not None and extraction_llm is None)
+        if index_identity is None and injected_index_producer:
+            raise ValueError("index_identity is required when injecting an embedding model, extraction LLM, or text preprocessor.")
+        self.text_preprocessor = text_preprocessor or TextPreprocessor()
+
+        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in redact_config(asdict(self.global_config)).items()])
+        logger.debug(f"HippoRAG init with config:\n  {_print_config}\n")
+
+        #LLM and embedding model specific working directories are created under every specified saving directories
+        llm_label = self.global_config.llm_name.replace("/", "_")
+        embedding_label = self.global_config.embedding_model_name.replace("/", "_")
+        self.working_dir = os.path.join(self.global_config.save_dir, f"{llm_label}_{embedding_label}")
+
+        if not os.path.exists(self.working_dir):
+            logger.info(f"Creating working directory: {self.working_dir}")
+            os.makedirs(self.working_dir, exist_ok=True)
+
+        self._owns_openie = False
+        if self.global_config.openie_mode == 'offline':
+            self._owns_llm_model = False
+            self.llm_model = extraction_llm or qa_llm
+            self.extraction_llm = extraction_llm or self.llm_model
+            self.qa_llm = qa_llm or self.llm_model
+            from .information_extraction.openie_vllm_offline import VLLMOfflineOpenIE
+            self.openie = self._construct_or_cleanup(lambda: VLLMOfflineOpenIE(self.global_config))
+            self._owns_openie = True
+        else:
+            self._owns_llm_model = extraction_llm is None and qa_llm is None
+            self.llm_model: BaseLLM = extraction_llm or qa_llm or self._construct_or_cleanup(lambda: _get_llm_class(self.global_config))
+            self.extraction_llm: BaseLLM = extraction_llm or self.llm_model
+            self.qa_llm: BaseLLM = qa_llm or self.llm_model
+
+        if self.global_config.openie_mode == 'online':
+            self.openie = self._construct_or_cleanup(
+                lambda: OpenIE(
+                    llm_model=self.extraction_llm,
+                    max_workers=self.global_config.openie_max_workers,
+                    ner_max_tokens=self.global_config.openie_ner_max_tokens,
+                    triple_max_tokens=self.global_config.openie_triple_max_tokens,
                 )
-                self._owns_openie = True
-            elif self.global_config.openie_mode == 'Transformers-offline':
-                from .information_extraction.openie_transformers_offline import TransformersOfflineOpenIE
-                self.openie = self._construct_or_cleanup(lambda: TransformersOfflineOpenIE(self.global_config, shared_llm=self.extraction_llm))
-                self._owns_openie = True
-            else:
-                raise ValueError(f"Unsupported openie_mode: {self.global_config.openie_mode}")
-    
-            self.graph = self._construct_or_cleanup(self.initialize_graph)
-    
+            )
+            self._owns_openie = True
+        elif self.global_config.openie_mode == 'Transformers-offline':
+            from .information_extraction.openie_transformers_offline import TransformersOfflineOpenIE
+            self.openie = self._construct_or_cleanup(lambda: TransformersOfflineOpenIE(self.global_config, shared_llm=self.extraction_llm))
+            self._owns_openie = True
+        elif self.global_config.openie_mode != 'offline':
+            raise ValueError(f"Unsupported openie_mode: {self.global_config.openie_mode}")
+
+        self.graph = self._construct_or_cleanup(self.initialize_graph)
+
+        if self.global_config.openie_mode == 'offline':
+            self.embedding_model = None
+            self._owns_embedding_model = False
+        else:
             self._owns_embedding_model = embedding_model is None
             self.embedding_model: BaseEmbeddingModel = embedding_model or self._construct_or_cleanup(
                 lambda: _get_embedding_model_class(
@@ -248,53 +261,58 @@ class HippoRAG:
                     embedding_model_name=self.global_config.embedding_model_name,
                 )
             )
-            self.chunk_embedding_store = self._construct_or_cleanup(
-                lambda: get_embedding_store(
-                    self.embedding_model,
-                    os.path.join(self.working_dir, "chunk_embeddings"),
-                    self.global_config.embedding_batch_size,
-                    'chunk',
-                    self.global_config,
-                )
+        self.chunk_embedding_store = self._construct_or_cleanup(
+            lambda: get_embedding_store(
+                self.embedding_model,
+                os.path.join(self.working_dir, "chunk_embeddings"),
+                self.global_config.embedding_batch_size,
+                'chunk',
+                self.global_config,
             )
-            self.entity_embedding_store = self._construct_or_cleanup(
-                lambda: get_embedding_store(
-                    self.embedding_model,
-                    os.path.join(self.working_dir, "entity_embeddings"),
-                    self.global_config.embedding_batch_size,
-                    'entity',
-                    self.global_config,
-                )
+        )
+        self.entity_embedding_store = self._construct_or_cleanup(
+            lambda: get_embedding_store(
+                self.embedding_model,
+                os.path.join(self.working_dir, "entity_embeddings"),
+                self.global_config.embedding_batch_size,
+                'entity',
+                self.global_config,
             )
-            self.fact_embedding_store = self._construct_or_cleanup(
-                lambda: get_embedding_store(
-                    self.embedding_model,
-                    os.path.join(self.working_dir, "fact_embeddings"),
-                    self.global_config.embedding_batch_size,
-                    'fact',
-                    self.global_config,
-                )
+        )
+        self.fact_embedding_store = self._construct_or_cleanup(
+            lambda: get_embedding_store(
+                self.embedding_model,
+                os.path.join(self.working_dir, "fact_embeddings"),
+                self.global_config.embedding_batch_size,
+                'fact',
+                self.global_config,
             )
-            self.index_manifest_path = os.path.join(self.working_dir, "index_manifest.json")
-            self.openie_results_path = os.path.join(self.global_config.save_dir,f'openie_results_ner_{self.global_config.llm_name.replace("/", "_")}.json')
-            self.openie_state_path = os.path.join(self.working_dir, "openie_state.json")
-            self.chunk_metadata_path = os.path.join(self.working_dir, "chunk_metadata.json")
-            if self.global_config.openie_mode != 'offline':
-                try:
-                    self._validate_or_create_index_manifest()
-                except Exception:
-                    self.close()
-                    raise
-                    
-            self.ready_to_retrieve = False
-            self.ppr_time = 0
-            self.rerank_time = 0
-            self.all_retrieval_time = 0
-    
-            self.ent_node_to_chunk_ids = None
-            self._openie_info = None
-            self._openie_provenance = None
-            self.chunk_metadata = self._construct_or_cleanup(self._load_chunk_metadata)
+        )
+        self.index_manifest_path = os.path.join(self.working_dir, "index_manifest.json")
+        self.openie_results_path = os.path.join(self.global_config.save_dir,f'openie_results_ner_{self.global_config.llm_name.replace("/", "_")}.json')
+        self.openie_state_path = os.path.join(self.working_dir, "openie_state.json")
+        self.chunk_metadata_path = os.path.join(self.working_dir, "chunk_metadata.json")
+        if self.global_config.openie_mode != 'offline':
+            try:
+                self._validate_or_create_index_manifest()
+            except Exception:
+                self.close()
+                raise
+
+        self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
+
+        self.rerank_filter = None if self.global_config.openie_mode == 'offline' else self._construct_or_cleanup(lambda: DSPyFilter(self))
+
+        self.ready_to_retrieve = False
+
+        self.ppr_time = 0
+        self.rerank_time = 0
+        self.all_retrieval_time = 0
+
+        self.ent_node_to_chunk_ids = None
+        self._openie_info = None
+        self._openie_provenance = None
+        self.chunk_metadata = self._construct_or_cleanup(self._load_chunk_metadata)
 
     def _validate_or_create_index_manifest(self) -> None:
         manifest = {
@@ -414,6 +432,7 @@ class HippoRAG:
             raise TypeError("Text preprocessors must return a list of Chunk instances.")
         return chunks
 
+
     def initialize_graph(self):
         """
         Initializes a graph using a Pickle file if available or creates a new graph.
@@ -469,34 +488,14 @@ class HippoRAG:
         new_openie_rows = {k : chunks[k] for k in chunk_keys_to_process}
 
         if len(chunk_keys_to_process) > 0:
-            if not self.openie_active:
-                raise RuntimeError("OpenIE is disabled and the requested chunks have no stored extraction results.")
             new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
             self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
 
         self._openie_info = all_openie_info
         self._save_openie_state(all_openie_info)
 
-        if self._disable_openie_after_preprocess:
-            self._disable_openie()
-            logger.info("Offline OpenIE completed. OpenIE resources have been released.")
+        raise RuntimeError("Offline OpenIE completed. Run indexing again with openie_mode='online' to build the graph.")
 
-    def _disable_openie(self) -> None:
-        """Release OpenIE resources after extraction while retaining results."""
-        openie = getattr(self, "openie", None)
-        if openie is not None:
-            disable = getattr(openie, "disable", None)
-            if callable(disable):
-                disable()
-            else:
-                close = getattr(openie, "close", None)
-                if callable(close):
-                    close()
-            for attribute in ("llm_model", "prompt_template_manager"):
-                if hasattr(openie, attribute):
-                    setattr(openie, attribute, None)
-        self.openie_active = False
-    
     def index(self, docs: List[Union[str, Chunk]]):
         """
         Indexes the given documents based on the HippoRAG 2 framework which generates an OpenIE knowledge graph
@@ -526,7 +525,7 @@ class HippoRAG:
         processed_chunks = self._preprocess_docs(docs)
         chunk_texts = [chunk.content for chunk in processed_chunks]
 
-        if self.global_config.openie_mode != 'online':
+        if self.global_config.openie_mode == 'offline':
             self.pre_openie(processed_chunks)
 
         self.chunk_embedding_store.insert_strings(chunk_texts)
@@ -543,19 +542,10 @@ class HippoRAG:
         chunk_to_rows = self.chunk_embedding_store.get_all_id_to_rows()
 
         all_openie_info, chunk_keys_to_process = self.load_existing_openie(
-            chunk_to_rows.keys(),
-            force_reextract=(
-                self.global_config.force_openie_from_scratch
-                and self.global_config.openie_mode == 'online'
-            ))
+            chunk_to_rows.keys(), force_reextract=self.global_config.force_openie_from_scratch)
         new_openie_rows = {k : chunk_to_rows[k] for k in chunk_keys_to_process}
 
-        if len(chunk_keys_to_process) > 0 and self.global_config.openie_mode != 'online':
-            if not self.openie_active:
-                raise RuntimeError(
-                    "OpenIE is disabled and the index contains chunks without stored extraction results. "
-                    "Run pre_openie first or enable OpenIE for this indexing pass."
-                )
+        if len(chunk_keys_to_process) > 0:
             new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
             self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
 
@@ -712,200 +702,106 @@ class HippoRAG:
             self.graph.delete_edges(edges_to_delete)
 
     def retrieve(self,
-                     queries: List[str],
-                     num_to_retrieve: int = None,
-                     gold_docs: List[List[str]] = None):
-            """
-            Parameters:
-                queries: List[str]
-                    A list of query strings for which documents are to be retrieved.
-                num_to_retrieve: int, optional
-                    The maximum number of documents to retrieve for each query. If not specified, defaults to
-                    the `retrieval_top_k` value defined in the global configuration.
-                gold_docs: List[List[str]], optional
-                    A list of lists containing gold-standard documents corresponding to each query. Required
-                    if retrieval performance evaluation is enabled (`do_eval_retrieval` in global configuration).
-    
-            Returns:
-                List[QuerySolution] or (List[QuerySolution], Dict)
-                    If retrieval performance evaluation is not enabled, returns a list of QuerySolution objects, each containing
-                    the retrieved documents and their scores for the corresponding query. If evaluation is enabled, also returns
-                    a dictionary containing the evaluation metrics computed over the retrieved results.
-    
-            Notes
-            -----
-            - Long queries with no relevant facts after reranking will default to results from dense passage retrieval.
-            """
-            retrieve_start_time = time.time()  # Record start time
-    
-            if num_to_retrieve is None:
-                num_to_retrieve = self.global_config.retrieval_top_k
-    
-            if gold_docs is not None:
-                retrieval_recall_evaluator = RetrievalRecall(global_config=self.global_config)
-    
-            if not self.ready_to_retrieve:
-                self.prepare_retrieval_objects()
-    
-            self.get_query_embeddings(queries)
-    
-            retrieval_results = []
-    
-            # for q_idx, query in tqdm(enumerate(queries), desc="Retrieving", total=len(queries)):
-            for query in queries:
-                rerank_start = time.time()
-                query_fact_scores = self.get_fact_scores(query)
-                top_k_fact_indices, top_k_facts, _ = self.get_top_k_facts_without_rerank(query_fact_scores)
-                rerank_end = time.time()
-    
-                self.rerank_time += rerank_end - rerank_start
-    
-                if len(top_k_facts) == 0:
-                    logger.info('No facts found after reranking, return DPR results')
-                    sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
-                else:
-                    sorted_doc_ids, sorted_doc_scores = self.graph_search_with_fact_entities(query=query,
-                                                                                             link_top_k=self.global_config.linking_top_k,
-                                                                                             query_fact_scores=query_fact_scores,
-                                                                                             top_k_facts=top_k_facts,
-                                                                                             top_k_fact_indices=top_k_fact_indices,
-                                                                                             passage_node_weight=self.global_config.passage_node_weight)
-    
-                top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]]
-    
-                retrieval_results.append(QuerySolution(question=query, docs=top_k_docs, doc_scores=sorted_doc_scores[:num_to_retrieve]))
-    
-            retrieve_end_time = time.time()  # Record end time
-    
-            self.all_retrieval_time += retrieve_end_time - retrieve_start_time
-    
-            logger.info(f"Total Retrieval Time {self.all_retrieval_time:.2f}s")
-            logger.info(f"Total Recognition Memory Time {self.rerank_time:.2f}s")
-            logger.info(f"Total PPR Time {self.ppr_time:.2f}s")
-            logger.info(f"Total Misc Time {self.all_retrieval_time - (self.rerank_time + self.ppr_time):.2f}s")
-    
-            # Evaluate retrieval
-            if gold_docs is not None:
-                k_list = [1, 2, 5, 10, 20, 30, 50, 100, 150, 200]
-                overall_retrieval_result, _ = retrieval_recall_evaluator.calculate_metric_scores(gold_docs=gold_docs, retrieved_docs=[retrieval_result.docs for retrieval_result in retrieval_results], k_list=k_list)
-                logger.info(f"Evaluation results for retrieval: {overall_retrieval_result}")
-    
-                return retrieval_results, overall_retrieval_result
-            else:
-                return retrieval_results
+                 queries: List[str],
+                 num_to_retrieve: int = None,
+                 gold_docs: List[List[str]] = None) -> List[QuerySolution] | Tuple[List[QuerySolution], Dict]:
+        """
+        Performs retrieval using the HippoRAG 2 framework, which consists of several steps:
+        - Fact Retrieval
+        - Recognition Memory for improved fact selection
+        - Dense passage scoring
+        - Personalized PageRank based re-ranking
 
-    def search(self,
-                       query: str, 
-                       num_to_retrieve: Optional[int] = None,
-                       return_scores: bool = False) -> Union[List[str], Tuple[List[str], List[float]]]:
-                """
-                Performs retrieval based on a query with special tokens.
-                - `[passage]`: Conducts dense retrieval from a corpus of passages.
-                - `[graph]`: Performs retrieval on a structured knowledge graph.
-                If both tokens are present, results are merged and deduplicated using reciprocal rank fusion.
-                Defaults to `[passage]` retrieval if no token is provided.
-            
-                Args:
-                    query: The query string, optionally containing [passage] and/or [graph] tokens
-                    num_to_retrieve: Maximum number of documents to retrieve
-                    return_scores: Whether to return relevance scores along with documents
-            
-                Returns:
-                    If return_scores is False:
-                        List[str]: List of retrieved documents
-                    If return_scores is True:
-                        Tuple[List[str], List[float]]: Tuple of (documents, scores)
-                """
-                if num_to_retrieve is None:
-                    num_to_retrieve = self.global_config.retrieval_top_k
-            
-                tokens = re.findall(r"\[(passage|graph)\]", query)
-                tokens = list(set(tokens))
-                query_text = re.sub(r"(\[passage\]|\[graph\])", "", query).strip()
-            
-                if not query_text:
-                    logger.warning("Search query text is empty, returning no documents.")
-                    return ([], []) if return_scores else []
-            
-                if not self.ready_to_retrieve:
-                    self.prepare_retrieval_objects()
-            
-                # Default to 'passage' if no tokens are specified
-                if not tokens:
-                    tokens = ['passage']
-            
-                all_docs = []
-                doc_rank_map = {}
-                doc_content_map = {}
-        
-                passage_results = []
-                graph_results = []
-                
-                for token in tokens:
-                    if token == 'passage':
-                        ids, scores = self.dense_passage_retrieval(query_text)
-                        docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[i])["content"] for i in ids[:num_to_retrieve * 2]]
-                        passage_results = list(zip(docs, scores))
-                        
-                        for rank, (doc, score) in enumerate(passage_results, 1):
-                            if doc not in doc_rank_map:
-                                doc_rank_map[doc] = {}
-                            doc_rank_map[doc]['passage'] = rank
-                            doc_content_map[doc] = doc
-                            all_docs.append(doc)
-                            
-                    else:  # graph
-                        search_results = self.retrieve(queries=[query_text], num_to_retrieve=num_to_retrieve * 2)
-                        if search_results:
-                            result = search_results[0]
-                            graph_results = list(zip(result.docs, result.doc_scores))
-                            
-                            for rank, (doc, score) in enumerate(graph_results, 1):
-                                if doc not in doc_rank_map:
-                                    doc_rank_map[doc] = {}
-                                doc_rank_map[doc]['graph'] = rank
-                                doc_content_map[doc] = doc
-                                all_docs.append(doc)
-        
-                seen = set()
-                unique_docs = []
-                unique_scores = []
-                for doc in all_docs:
-                    if doc not in seen:
-                        seen.add(doc)
-                        unique_docs.append(doc)
-                        if return_scores:
-                            if len(tokens) == 2:
-                                # Reciprocal Rank Fusion
-                                rrf_score = 0.0
-                                k = 60
-                                if 'passage' in doc_rank_map[doc]:
-                                    rrf_score += 1.0 / (k + doc_rank_map[doc]['passage'])
-                                if 'graph' in doc_rank_map[doc]:
-                                    rrf_score += 1.0 / (k + doc_rank_map[doc]['graph'])           
-                                unique_scores.append(rrf_score)
-                            else:
-                                if tokens[0] == 'passage':
-                                    for result_doc, score in passage_results:
-                                        if result_doc == doc:
-                                            unique_scores.append(score)
-                                            break
-                                else:
-                                    for result_doc, score in graph_results:
-                                        if result_doc == doc:
-                                            unique_scores.append(score)
-                                            break
-            
-                doc_score_pairs = list(zip(unique_docs, unique_scores))
-                doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
-                unique_docs = [doc for doc, _ in doc_score_pairs[:num_to_retrieve]]
-                unique_scores = [score for _, score in doc_score_pairs[:num_to_retrieve]]
-                
-                if return_scores:
-                    return unique_docs, unique_scores
-                else:
-                    return unique_docs[:num_to_retrieve]
-    
+        Parameters:
+            queries: List[str]
+                A list of query strings for which documents are to be retrieved.
+            num_to_retrieve: int, optional
+                The maximum number of documents to retrieve for each query. If not specified, defaults to
+                the `retrieval_top_k` value defined in the global configuration.
+            gold_docs: List[List[str]], optional
+                A list of lists containing gold-standard documents corresponding to each query. Required
+                if retrieval performance evaluation is enabled (`do_eval_retrieval` in global configuration).
+
+        Returns:
+            List[QuerySolution] or (List[QuerySolution], Dict)
+                If retrieval performance evaluation is not enabled, returns a list of QuerySolution objects, each containing
+                the retrieved documents and their scores for the corresponding query. If evaluation is enabled, also returns
+                a dictionary containing the evaluation metrics computed over the retrieved results.
+
+        Notes
+        -----
+        - Long queries with no relevant facts after reranking will default to results from dense passage retrieval.
+        """
+        ensure_list_input(queries, "queries")
+        validate_parallel_input_lengths(queries, gold_docs=gold_docs)
+        retrieve_start_time = time.time()  # Record start time
+
+        if num_to_retrieve is None:
+            num_to_retrieve = self.global_config.retrieval_top_k
+        if not isinstance(num_to_retrieve, int) or num_to_retrieve < 1:
+            raise ValueError("num_to_retrieve must be a positive integer.")
+
+        if gold_docs is not None:
+            retrieval_recall_evaluator = RetrievalRecall(global_config=self.global_config)
+
+        if not self.ready_to_retrieve:
+            self.prepare_retrieval_objects()
+
+        self.get_query_embeddings(queries)
+
+        retrieval_results = []
+
+        for q_idx, query in tqdm(enumerate(queries), desc="Retrieving", total=len(queries)):
+            rerank_start = time.time()
+            query_fact_scores = self.get_fact_scores(query)
+            top_k_fact_indices, top_k_facts, rerank_log = self.rerank_facts(query, query_fact_scores)
+            rerank_end = time.time()
+
+            self.rerank_time += rerank_end - rerank_start
+
+            if len(top_k_facts) == 0:
+                logger.info('No facts found after reranking, return DPR results')
+                sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
+            else:
+                sorted_doc_ids, sorted_doc_scores = self.graph_search_with_fact_entities(query=query,
+                                                                                         link_top_k=self.global_config.linking_top_k,
+                                                                                         query_fact_scores=query_fact_scores,
+                                                                                         top_k_facts=top_k_facts,
+                                                                                         top_k_fact_indices=top_k_fact_indices,
+                                                                                         passage_node_weight=self.global_config.passage_node_weight)
+
+            result = self._build_retrieval_result(query, sorted_doc_ids, sorted_doc_scores, num_to_retrieve, top_k_facts)
+            retrieval_results.append(QuerySolution(question=result.query, docs=result.docs, doc_scores=result.scores,
+                                                   doc_metadata=result.doc_metadata, graph_seeds=result.graph_seeds))
+
+        retrieve_end_time = time.time()  # Record end time
+
+        self.all_retrieval_time += retrieve_end_time - retrieve_start_time
+
+        logger.info(f"Total Retrieval Time {self.all_retrieval_time:.2f}s")
+        logger.info(f"Total Recognition Memory Time {self.rerank_time:.2f}s")
+        logger.info(f"Total PPR Time {self.ppr_time:.2f}s")
+        logger.info(f"Total Misc Time {self.all_retrieval_time - (self.rerank_time + self.ppr_time):.2f}s")
+
+        # Evaluate retrieval
+        if gold_docs is not None:
+            k_list = [1, 2, 5, 10, 20, 30, 50, 100, 150, 200]
+            overall_retrieval_result, example_retrieval_results = retrieval_recall_evaluator.calculate_metric_scores(gold_docs=gold_docs, retrieved_docs=[retrieval_result.docs for retrieval_result in retrieval_results], k_list=k_list)
+            logger.info(f"Evaluation results for retrieval: {overall_retrieval_result}")
+
+            return retrieval_results, overall_retrieval_result
+        else:
+            return retrieval_results
+
+    def _build_retrieval_result(self, query: str, sorted_doc_ids: np.ndarray, sorted_doc_scores: np.ndarray,
+                                num_to_retrieve: int, graph_seeds: Optional[List[Tuple]] = None) -> RetrievalResult:
+        passage_keys = [self.passage_node_keys[idx] for idx in sorted_doc_ids[:num_to_retrieve]]
+        docs = [self.chunk_embedding_store.get_row(key)["content"] for key in passage_keys]
+        metadata = [dict(self.chunk_metadata.get(key, {})) for key in passage_keys]
+        return RetrievalResult(query=query, docs=docs, scores=np.asarray(sorted_doc_scores[:num_to_retrieve]),
+                               doc_metadata=metadata, graph_seeds=graph_seeds or [])
+
+
     def add_fact_edges(self, chunk_ids: List[str], chunk_triples: List[Tuple]):
         """
         Adds fact edges from given triples to the graph.
@@ -1534,7 +1430,7 @@ class HippoRAG:
                     self.proc_triples_to_docs[str(proc_triple)] = self.proc_triples_to_docs.get(str(proc_triple), set()).union(set([doc['idx']]))
 
         if self.ent_node_to_chunk_ids is None:
-            _, triple_results_dict = reformat_openie_results(all_openie_info)
+            ner_results_dict, triple_results_dict = reformat_openie_results(all_openie_info)
 
             # prepare data_store
             chunk_triples = [[text_processing(t) for t in triple_results_dict[chunk_id].triples] for chunk_id in self.passage_node_keys]
@@ -1735,31 +1631,6 @@ class HippoRAG:
 
         return all_phrase_weights, linking_score_map
 
-    def get_top_k_facts_without_rerank(self, query_fact_scores: np.ndarray) -> Tuple[List[int], List[Tuple], dict]:
-            """
-            Get top k facts directly based on scores without reranking.
-    
-            Args:
-                query_fact_scores: Array of similarity scores between query and all facts
-    
-            Returns:
-                top_k_fact_indices: List of indices for the top k facts
-                top_k_facts: List of top k facts (each fact is a tuple)
-                log (dict): Log information containing selected facts
-            """
-            # load args
-            link_top_k: int = self.global_config.linking_top_k
-    
-            # Sort by scores and take top link_top_k facts
-            top_k_fact_indices = np.argsort(query_fact_scores)[-link_top_k:][::-1].tolist()  # list of ranked link_top_k fact relative indices
-            real_top_k_fact_ids = [self.fact_node_keys[idx] for idx in top_k_fact_indices]  # list of ranked link_top_k fact keys
-            fact_row_dict = self.fact_embedding_store.get_rows(real_top_k_fact_ids)
-            top_k_facts = [eval(fact_row_dict[id]['content']) for id in real_top_k_fact_ids]  # list of link_top_k facts (each fact is a relation triple in tuple data type)
-    
-            log = {'top_k_facts': top_k_facts}
-    
-            return top_k_fact_indices, top_k_facts, log
-    
     def graph_search_with_fact_entities(self, query: str,
                                         link_top_k: int,
                                         query_fact_scores: np.ndarray,
@@ -1801,6 +1672,7 @@ class HippoRAG:
 
         for rank, f in enumerate(top_k_facts):
             subject_phrase = f[0].lower()
+            predicate_phrase = f[1].lower()
             object_phrase = f[2].lower()
             fact_score = query_fact_scores[
                 top_k_fact_indices[rank]] if query_fact_scores.ndim > 0 else query_fact_scores
@@ -1875,6 +1747,59 @@ class HippoRAG:
         return ppr_sorted_doc_ids, ppr_sorted_doc_scores
 
 
+    def rerank_facts(self, query: str, query_fact_scores: np.ndarray) -> Tuple[List[int], List[Tuple], dict]:
+        """
+
+        Args:
+
+        Returns:
+            top_k_fact_indicies:
+            top_k_facts:
+            rerank_log (dict): {'facts_before_rerank': candidate_facts, 'facts_after_rerank': top_k_facts}
+                - candidate_facts (list): list of link_top_k facts (each fact is a relation triple in tuple data type).
+                - top_k_facts:
+
+
+        """
+        # load args
+        link_top_k: int = self.global_config.linking_top_k
+
+        if link_top_k <= 0:
+            return [], [], {'facts_before_rerank': [], 'facts_after_rerank': []}
+        
+        # Check if there are any facts to rerank
+        if len(query_fact_scores) == 0 or len(self.fact_node_keys) == 0:
+            logger.warning("No facts available for reranking. Returning empty lists.")
+            return [], [], {'facts_before_rerank': [], 'facts_after_rerank': []}
+            
+        try:
+            # Get the top k facts by score
+            if len(query_fact_scores) <= link_top_k:
+                # If we have fewer facts than requested, use all of them
+                candidate_fact_indices = np.argsort(query_fact_scores)[::-1].tolist()
+            else:
+                # Otherwise get the top k
+                candidate_fact_indices = np.argsort(query_fact_scores)[-link_top_k:][::-1].tolist()
+                
+            # Get the actual fact IDs
+            real_candidate_fact_ids = [self.fact_node_keys[idx] for idx in candidate_fact_indices]
+            fact_row_dict = self.fact_embedding_store.get_rows(real_candidate_fact_ids)
+            candidate_facts = [ast.literal_eval(fact_row_dict[id]['content']) for id in real_candidate_fact_ids]
+            
+            # Rerank the facts
+            top_k_fact_indices, top_k_facts, reranker_dict = self.rerank_filter(query,
+                                                                                candidate_facts,
+                                                                                candidate_fact_indices,
+                                                                                len_after_rerank=link_top_k)
+            
+            rerank_log = {'facts_before_rerank': candidate_facts, 'facts_after_rerank': top_k_facts}
+            
+            return top_k_fact_indices, top_k_facts, rerank_log
+            
+        except Exception as e:
+            logger.error(f"Error in rerank_facts: {str(e)}")
+            return [], [], {'facts_before_rerank': [], 'facts_after_rerank': [], 'error': str(e)}
+    
     def run_ppr(self,
                 reset_prob: np.ndarray,
                 damping: float =0.5) -> Tuple[np.ndarray, np.ndarray]:

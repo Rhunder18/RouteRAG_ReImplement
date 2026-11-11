@@ -29,7 +29,6 @@ class TransformersOfflineOpenIE():
         self.llm_model = None
 
     def batch_openie(self, chunks: Dict[str, ChunkInfo]) -> Tuple[Dict[str, NerRawOutput], Dict[str, TripleRawOutput]]:
-        self._require_active()
         """
         Conduct batch OpenIE synchronously using vLLM offline batch mode, including NER and triple extraction
 

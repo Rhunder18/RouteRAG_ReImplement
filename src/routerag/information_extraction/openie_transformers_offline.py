@@ -50,7 +50,7 @@ class TransformersOfflineOpenIE(BaseOpenIE):
         chunk_passages = {chunk_key: chunk["content"] for chunk_key, chunk in chunks.items()}
 
         ner_input_messages = [self.prompt_template_manager.render(name='ner', passage=p) for p in chunk_passages.values()]
-        ner_output, ner_output_metadata = self.llm_model.batch_infer(ner_input_messages, json_template='ner', max_tokens=512)
+        ner_output, ner_output_metadata = self.llm_model.batch_infer(ner_input_messages, json_template='ner', max_tokens=1024)
 
         triple_extract_input_messages = [self.prompt_template_manager.render(
             name='triple_extraction',

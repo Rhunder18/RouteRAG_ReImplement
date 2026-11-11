@@ -1,8 +1,7 @@
-import os
-
 from typing import List
 import torch.cuda
-import outlines
+import outlines.generate as generate
+import outlines.models as models
 
 from .base import LLMConfig
 from ..utils.llm_utils import TextChatMessage, get_pydantic_model
@@ -50,6 +49,11 @@ class UnslothOffline:
             )
             FastLanguageModel.for_inference(self.model)
         
+        if not getattr(self.model.config, "is_encoder_decoder", False):
+            if self.tokenizer.padding_side != "left":
+                self.tokenizer.padding_side = "left"
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
         if cache_filename is None:
             cache_filename = f'{model_name.replace("/", "_")}_cache.sqlite'
         if cache_dir is None:

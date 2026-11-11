@@ -2,6 +2,7 @@ from typing import List
 import torch.cuda
 import outlines.generate as generate
 import outlines.models as models
+from tqdm import tqdm
 
 from .base import LLMConfig
 from ..utils.llm_utils import TextChatMessage, get_pydantic_model
@@ -70,7 +71,13 @@ class TransformersOffline:
         }
         return response, metadata
 
-    def batch_infer(self, messages_list: List[List[TextChatMessage]], max_tokens=2048, json_template=None):
+    def batch_infer(
+        self,
+        messages_list: List[List[TextChatMessage]],
+        max_tokens=2048,
+        json_template=None,
+        progress_desc=None,
+    ):
         if len(messages_list) > 1:
             logger.info(f"Calling Transformers offline, # of messages {len(messages_list)}, using batchsize = 4")
 
@@ -82,12 +89,23 @@ class TransformersOffline:
             outlines_model = models.Transformers(self.model, self.tokenizer)
             generator = generate.json(outlines_model, guided_json)
             transformers_outputs = []
-            for i in range(0, len(all_prompt_texts), 4):
+            batch_ranges = range(0, len(all_prompt_texts), 4)
+            if progress_desc is not None:
+                batch_ranges = tqdm(
+                    batch_ranges,
+                    total=(len(all_prompt_texts) + 3) // 4,
+                    desc=progress_desc,
+                    unit="batch",
+                )
+            for i in batch_ranges:
                 transformers_output = generator(all_prompt_texts[i:i+4], max_tokens=max_tokens)
                 transformers_outputs.extend(transformers_output)
             all_responses = [completion.model_dump_json() for completion in transformers_outputs]
         else:
-            all_responses = [self._generate_text(prompt_text, max_tokens) for prompt_text in all_prompt_texts]
+            prompts = all_prompt_texts
+            if progress_desc is not None:
+                prompts = tqdm(prompts, desc=progress_desc, unit="request")
+            all_responses = [self._generate_text(prompt_text, max_tokens) for prompt_text in prompts]
         if len(all_responses) != len(messages_list):
             raise RuntimeError(f"Transformers offline returned {len(all_responses)} outputs for {len(messages_list)} prompts.")
         all_prompt_tokens = [len(self.tokenizer.encode(prompt)) for prompt in all_prompt_texts]

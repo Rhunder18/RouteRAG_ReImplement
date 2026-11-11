@@ -7,15 +7,12 @@ from ..utils.misc_utils import NerRawOutput, TripleRawOutput
 from ..utils.logging_utils import get_logger
 from ..prompts import PromptTemplateManager
 from ..llm.transformers_offline import TransformersOffline
-from .base import BaseOpenIE
 
 logger = get_logger(__name__)
 
 
-class TransformersOfflineOpenIE(BaseOpenIE):
+class TransformersOfflineOpenIE():
     def __init__(self, global_config, shared_llm=None, active: bool = True):
-        super().__init__(active=active)
-
         self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
         self.llm_model = TransformersOffline(global_config, model=getattr(shared_llm, "model", None), tokenizer=getattr(shared_llm, "tokenizer", None))
         self._owns_model_resources = shared_llm is None
@@ -50,14 +47,24 @@ class TransformersOfflineOpenIE(BaseOpenIE):
         chunk_passages = {chunk_key: chunk["content"] for chunk_key, chunk in chunks.items()}
 
         ner_input_messages = [self.prompt_template_manager.render(name='ner', passage=p) for p in chunk_passages.values()]
-        ner_output, ner_output_metadata = self.llm_model.batch_infer(ner_input_messages, json_template='ner', max_tokens=1024)
+        ner_output, ner_output_metadata = self.llm_model.batch_infer(
+            ner_input_messages,
+            json_template='ner',
+            max_tokens=1024,
+            progress_desc="NER",
+        )
 
         triple_extract_input_messages = [self.prompt_template_manager.render(
             name='triple_extraction',
             passage=passage,
             named_entity_json=named_entities
         ) for passage, named_entities in zip(chunk_passages.values(), ner_output)]
-        triple_output, triple_output_metadata = self.llm_model.batch_infer(triple_extract_input_messages, json_template='triples', max_tokens=2048)
+        triple_output, triple_output_metadata = self.llm_model.batch_infer(
+            triple_extract_input_messages,
+            json_template='triples',
+            max_tokens=2048,
+            progress_desc="Triple extraction",
+        )
 
         ner_raw_outputs = []
         for idx, ner_output_instance in enumerate(ner_output):

@@ -40,7 +40,7 @@ from .utils.logging_utils import redact_config
 
 logger = logging.getLogger(__name__)
 
-class HippoRAG:
+class RouteRAG:
 
     def __enter__(self):
         return self

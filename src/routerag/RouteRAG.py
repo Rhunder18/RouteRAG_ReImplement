@@ -858,27 +858,26 @@ class RouteRAG:
             if doc not in seen:
                 seen.add(doc)
                 unique_docs.append(doc)
-                if return_scores:
-                    if len(tokens) == 2:
-                        # Reciprocal Rank Fusion
-                        rrf_score = 0.0
-                        k = 60
-                        if 'passage' in doc_rank_map[doc]:
-                            rrf_score += 1.0 / (k + doc_rank_map[doc]['passage'])
-                        if 'graph' in doc_rank_map[doc]:
-                            rrf_score += 1.0 / (k + doc_rank_map[doc]['graph'])           
-                        unique_scores.append(rrf_score)
+                if len(tokens) == 2:
+                    # Reciprocal Rank Fusion
+                    rrf_score = 0.0
+                    k = 60
+                    if 'passage' in doc_rank_map[doc]:
+                        rrf_score += 1.0 / (k + doc_rank_map[doc]['passage'])
+                    if 'graph' in doc_rank_map[doc]:
+                        rrf_score += 1.0 / (k + doc_rank_map[doc]['graph'])           
+                    unique_scores.append(rrf_score)
+                else:
+                    if tokens[0] == 'passage':
+                        for result_doc, score in passage_results:
+                            if result_doc == doc:
+                                unique_scores.append(score)
+                                break
                     else:
-                        if tokens[0] == 'passage':
-                            for result_doc, score in passage_results:
-                                if result_doc == doc:
-                                    unique_scores.append(score)
-                                    break
-                        else:
-                            for result_doc, score in graph_results:
-                                if result_doc == doc:
-                                    unique_scores.append(score)
-                                    break
+                        for result_doc, score in graph_results:
+                            if result_doc == doc:
+                                unique_scores.append(score)
+                                break
     
         doc_score_pairs = list(zip(unique_docs, unique_scores))
         doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
@@ -888,7 +887,7 @@ class RouteRAG:
         if return_scores:
             return unique_docs, unique_scores
         else:
-            return unique_docs[:num_to_retrieve]
+            return unique_docs
     
     def add_fact_edges(self, chunk_ids: List[str], chunk_triples: List[Tuple]):
         """

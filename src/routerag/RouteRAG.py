@@ -779,116 +779,116 @@ class RouteRAG:
                 return retrieval_results
 
     def search(self,
-                       query: str, 
-                       num_to_retrieve: Optional[int] = None,
-                       return_scores: bool = False) -> Union[List[str], Tuple[List[str], List[float]]]:
-                """
-                Performs retrieval based on a query with special tokens.
-                - `[passage]`: Conducts dense retrieval from a corpus of passages.
-                - `[graph]`: Performs retrieval on a structured knowledge graph.
-                If both tokens are present, results are merged and deduplicated using reciprocal rank fusion.
-                Defaults to `[passage]` retrieval if no token is provided.
-            
-                Args:
-                    query: The query string, optionally containing [passage] and/or [graph] tokens
-                    num_to_retrieve: Maximum number of documents to retrieve
-                    return_scores: Whether to return relevance scores along with documents
-            
-                Returns:
-                    If return_scores is False:
-                        List[str]: List of retrieved documents
-                    If return_scores is True:
-                        Tuple[List[str], List[float]]: Tuple of (documents, scores)
-                """
-                if num_to_retrieve is None:
-                    num_to_retrieve = self.global_config.retrieval_top_k
-            
-                tokens = re.findall(r"\[(passage|graph)\]", query)
-                tokens = list(set(tokens))
-                query_text = re.sub(r"(\[passage\]|\[graph\])", "", query).strip()
-            
-                if not query_text:
-                    logger.warning("Search query text is empty, returning no documents.")
-                    return ([], []) if return_scores else []
-            
-                if not self.ready_to_retrieve:
-                    self.prepare_retrieval_objects()
-            
-                # Default to 'passage' if no tokens are specified
-                if not tokens:
-                    tokens = ['passage']
-            
-                all_docs = []
-                doc_rank_map = {}
-                doc_content_map = {}
+                query: str, 
+                num_to_retrieve: Optional[int] = None,
+                return_scores: bool = False) -> Union[List[str], Tuple[List[str], List[float]]]:
+        """
+        Performs retrieval based on a query with special tokens.
+        - `[passage]`: Conducts dense retrieval from a corpus of passages.
+        - `[graph]`: Performs retrieval on a structured knowledge graph.
+        If both tokens are present, results are merged and deduplicated using reciprocal rank fusion.
+        Defaults to `[passage]` retrieval if no token is provided.
+    
+        Args:
+            query: The query string, optionally containing [passage] and/or [graph] tokens
+            num_to_retrieve: Maximum number of documents to retrieve
+            return_scores: Whether to return relevance scores along with documents
+    
+        Returns:
+            If return_scores is False:
+                List[str]: List of retrieved documents
+            If return_scores is True:
+                Tuple[List[str], List[float]]: Tuple of (documents, scores)
+        """
+        if num_to_retrieve is None:
+            num_to_retrieve = self.global_config.retrieval_top_k
+    
+        tokens = re.findall(r"\[(passage|graph)\]", query)
+        tokens = list(set(tokens))
+        query_text = re.sub(r"(\[passage\]|\[graph\])", "", query).strip()
+    
+        if not query_text:
+            logger.warning("Search query text is empty, returning no documents.")
+            return ([], []) if return_scores else []
+    
+        if not self.ready_to_retrieve:
+            self.prepare_retrieval_objects()
+    
+        # Default to 'passage' if no tokens are specified
+        if not tokens:
+            tokens = ['passage']
+    
+        all_docs = []
+        doc_rank_map = {}
+        doc_content_map = {}
+
+        passage_results = []
+        graph_results = []
         
-                passage_results = []
-                graph_results = []
+        for token in tokens:
+            if token == 'passage':
+                ids, scores = self.dense_passage_retrieval(query_text)
+                docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[i])["content"] for i in ids[:num_to_retrieve * 2]]
+                passage_results = list(zip(docs, scores))
                 
-                for token in tokens:
-                    if token == 'passage':
-                        ids, scores = self.dense_passage_retrieval(query_text)
-                        docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[i])["content"] for i in ids[:num_to_retrieve * 2]]
-                        passage_results = list(zip(docs, scores))
-                        
-                        for rank, (doc, score) in enumerate(passage_results, 1):
-                            if doc not in doc_rank_map:
-                                doc_rank_map[doc] = {}
-                            doc_rank_map[doc]['passage'] = rank
-                            doc_content_map[doc] = doc
-                            all_docs.append(doc)
-                            
-                    else:  # graph
-                        search_results = self.retrieve(queries=[query_text], num_to_retrieve=num_to_retrieve * 2)
-                        if search_results:
-                            result = search_results[0]
-                            graph_results = list(zip(result.docs, result.doc_scores))
-                            
-                            for rank, (doc, score) in enumerate(graph_results, 1):
-                                if doc not in doc_rank_map:
-                                    doc_rank_map[doc] = {}
-                                doc_rank_map[doc]['graph'] = rank
-                                doc_content_map[doc] = doc
-                                all_docs.append(doc)
-        
-                seen = set()
-                unique_docs = []
-                unique_scores = []
-                for doc in all_docs:
-                    if doc not in seen:
-                        seen.add(doc)
-                        unique_docs.append(doc)
-                        if return_scores:
-                            if len(tokens) == 2:
-                                # Reciprocal Rank Fusion
-                                rrf_score = 0.0
-                                k = 60
-                                if 'passage' in doc_rank_map[doc]:
-                                    rrf_score += 1.0 / (k + doc_rank_map[doc]['passage'])
-                                if 'graph' in doc_rank_map[doc]:
-                                    rrf_score += 1.0 / (k + doc_rank_map[doc]['graph'])           
-                                unique_scores.append(rrf_score)
-                            else:
-                                if tokens[0] == 'passage':
-                                    for result_doc, score in passage_results:
-                                        if result_doc == doc:
-                                            unique_scores.append(score)
-                                            break
-                                else:
-                                    for result_doc, score in graph_results:
-                                        if result_doc == doc:
-                                            unique_scores.append(score)
-                                            break
-            
-                doc_score_pairs = list(zip(unique_docs, unique_scores))
-                doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
-                unique_docs = [doc for doc, _ in doc_score_pairs[:num_to_retrieve]]
-                unique_scores = [score for _, score in doc_score_pairs[:num_to_retrieve]]
-                
+                for rank, (doc, score) in enumerate(passage_results, 1):
+                    if doc not in doc_rank_map:
+                        doc_rank_map[doc] = {}
+                    doc_rank_map[doc]['passage'] = rank
+                    doc_content_map[doc] = doc
+                    all_docs.append(doc)
+                    
+            else:  # graph
+                search_results = self.retrieve(queries=[query_text], num_to_retrieve=num_to_retrieve * 2)
+                if search_results:
+                    result = search_results[0]
+                    graph_results = list(zip(result.docs, result.doc_scores))
+                    
+                    for rank, (doc, score) in enumerate(graph_results, 1):
+                        if doc not in doc_rank_map:
+                            doc_rank_map[doc] = {}
+                        doc_rank_map[doc]['graph'] = rank
+                        doc_content_map[doc] = doc
+                        all_docs.append(doc)
+
+        seen = set()
+        unique_docs = []
+        unique_scores = []
+        for doc in all_docs:
+            if doc not in seen:
+                seen.add(doc)
+                unique_docs.append(doc)
                 if return_scores:
-                    return unique_docs, unique_scores
-                else:
-                    return unique_docs[:num_to_retrieve]
+                    if len(tokens) == 2:
+                        # Reciprocal Rank Fusion
+                        rrf_score = 0.0
+                        k = 60
+                        if 'passage' in doc_rank_map[doc]:
+                            rrf_score += 1.0 / (k + doc_rank_map[doc]['passage'])
+                        if 'graph' in doc_rank_map[doc]:
+                            rrf_score += 1.0 / (k + doc_rank_map[doc]['graph'])           
+                        unique_scores.append(rrf_score)
+                    else:
+                        if tokens[0] == 'passage':
+                            for result_doc, score in passage_results:
+                                if result_doc == doc:
+                                    unique_scores.append(score)
+                                    break
+                        else:
+                            for result_doc, score in graph_results:
+                                if result_doc == doc:
+                                    unique_scores.append(score)
+                                    break
+    
+        doc_score_pairs = list(zip(unique_docs, unique_scores))
+        doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
+        unique_docs = [doc for doc, _ in doc_score_pairs[:num_to_retrieve]]
+        unique_scores = [score for _, score in doc_score_pairs[:num_to_retrieve]]
+        
+        if return_scores:
+            return unique_docs, unique_scores
+        else:
+            return unique_docs[:num_to_retrieve]
     
     def add_fact_edges(self, chunk_ids: List[str], chunk_triples: List[Tuple]):
         """

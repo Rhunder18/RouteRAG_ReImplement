@@ -95,7 +95,7 @@ class OpenIE:
         metadata = {}
         try:
             # LLM INFERENCE
-            inference_kwargs = {"max_new_tokens": self.ner_max_tokens}
+            inference_kwargs = {"max_tokens": self.ner_max_tokens}
             response_format = getattr(getattr(self.llm_model, "global_config", None), "response_format", None)
             if response_format is not None:
                 inference_kwargs["response_format"] = response_format
@@ -144,7 +144,7 @@ class OpenIE:
         metadata = {}
         try:
             # LLM INFERENCE
-            inference_kwargs = {"max_new_tokens": self.triple_max_tokens}
+            inference_kwargs = {"max_tokens": self.triple_max_tokens}
             response_format = getattr(getattr(self.llm_model, "global_config", None), "response_format", None)
             if response_format is not None:
                 inference_kwargs["response_format"] = response_format

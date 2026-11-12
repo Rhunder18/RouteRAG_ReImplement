@@ -70,6 +70,21 @@ class RouteRAG:
             closed_ids.add(id(resource))
         self._closed_resource_ids = closed_ids
 
+    def _close_openie_resources(self) -> None:
+        resources = [
+            getattr(self, "openie", None),
+            getattr(self, "extraction_llm", None),
+        ]
+        closed_ids = getattr(self, "_closed_resource_ids", set())
+        for resource in resources:
+            if resource is None or id(resource) in closed_ids:
+                continue
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
+            closed_ids.add(id(resource))
+        self._closed_resource_ids = closed_ids
+
     def _construct_or_cleanup(self, factory):
         try:
             return factory()
@@ -97,7 +112,7 @@ class RouteRAG:
                      embedding_provider=None,
                      llm_api_key_env=None,
                      embedding_api_key_env=None,
-                     openie_active=False):
+                     disable_openie_after_process=True):
             """
             Initializes an instance of the class and its related components.
     
@@ -135,11 +150,13 @@ class RouteRAG:
                 llm_base_url: LLM URL for a deployed LLM model, can be inserted directly as well as through configuration file.
                 llm_api_key_env: Environment variable holding the LLM API key for an OpenAI-compatible endpoint.
                 embedding_api_key_env: Environment variable holding the API key for an OpenAI-compatible embedding endpoint.
+                disable_openie_after_process: Whether to close OpenIE resources after indexing.
             """
             if global_config is None:
                 self.global_config = BaseConfig()
             else:
                 self.global_config = global_config
+            self.disable_openie_after_process = disable_openie_after_process
     
             #Overwriting Configuration if Specified
             if save_dir is not None:
@@ -206,12 +223,6 @@ class RouteRAG:
                 os.makedirs(self.working_dir, exist_ok=True)
     
             self._owns_openie = False
-            self._disable_openie_after_preprocess = (
-                not openie_active and self.global_config.openie_mode != "online"
-            )
-            # OpenIE must remain available while pre_openie is running. The
-            # requested flag controls its lifecycle after extraction.
-            self.openie_active = True
             self._owns_llm_model = extraction_llm is None if self.global_config.openie_mode != 'offline' else False
             self.extraction_llm: BaseLLM = extraction_llm or self._construct_or_cleanup(lambda: _get_llm_class(self.global_config))
                 
@@ -469,34 +480,14 @@ class RouteRAG:
         new_openie_rows = {k : chunks[k] for k in chunk_keys_to_process}
 
         if len(chunk_keys_to_process) > 0:
-            if not self.openie_active:
-                raise RuntimeError("OpenIE is disabled and the requested chunks have no stored extraction results.")
             new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
             self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
 
         self._openie_info = all_openie_info
         self._save_openie_state(all_openie_info)
 
-        if self._disable_openie_after_preprocess:
-            self._disable_openie()
-            logger.info("Offline OpenIE completed. OpenIE resources have been released.")
+        raise RuntimeError("Offline OpenIE completed. Run indexing again with openie_mode='online' to build the graph.")
 
-    def _disable_openie(self) -> None:
-        """Release OpenIE resources after extraction while retaining results."""
-        openie = getattr(self, "openie", None)
-        if openie is not None:
-            disable = getattr(openie, "disable", None)
-            if callable(disable):
-                disable()
-            else:
-                close = getattr(openie, "close", None)
-                if callable(close):
-                    close()
-            for attribute in ("llm_model", "prompt_template_manager"):
-                if hasattr(openie, attribute):
-                    setattr(openie, attribute, None)
-        self.openie_active = False
-    
     def index(self, docs: List[Union[str, Chunk]]):
         """
         Indexes the given documents based on the HippoRAG 2 framework which generates an OpenIE knowledge graph
@@ -526,7 +517,7 @@ class RouteRAG:
         processed_chunks = self._preprocess_docs(docs)
         chunk_texts = [chunk.content for chunk in processed_chunks]
 
-        if self.global_config.openie_mode != 'online':
+        if self.global_config.openie_mode == 'offline':
             self.pre_openie(processed_chunks)
 
         self.chunk_embedding_store.insert_strings(chunk_texts)
@@ -543,19 +534,10 @@ class RouteRAG:
         chunk_to_rows = self.chunk_embedding_store.get_all_id_to_rows()
 
         all_openie_info, chunk_keys_to_process = self.load_existing_openie(
-            chunk_to_rows.keys(),
-            force_reextract=(
-                self.global_config.force_openie_from_scratch
-                and self.global_config.openie_mode == 'online'
-            ))
+            chunk_to_rows.keys(), force_reextract=self.global_config.force_openie_from_scratch)
         new_openie_rows = {k : chunk_to_rows[k] for k in chunk_keys_to_process}
 
-        if len(chunk_keys_to_process) > 0 and self.global_config.openie_mode != 'online':
-            if not self.openie_active:
-                raise RuntimeError(
-                    "OpenIE is disabled and the index contains chunks without stored extraction results. "
-                    "Run pre_openie first or enable OpenIE for this indexing pass."
-                )
+        if len(chunk_keys_to_process) > 0:
             new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
             self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
 
@@ -601,6 +583,8 @@ class RouteRAG:
             self.save_igraph()
 
         self.ready_to_retrieve = False
+        if self.disable_openie_after_process:
+            self._close_openie_resources()
 
     def delete(self, docs_to_delete: List[str]):
         """
@@ -1534,7 +1518,7 @@ class RouteRAG:
                     self.proc_triples_to_docs[str(proc_triple)] = self.proc_triples_to_docs.get(str(proc_triple), set()).union(set([doc['idx']]))
 
         if self.ent_node_to_chunk_ids is None:
-            _, triple_results_dict = reformat_openie_results(all_openie_info)
+            ner_results_dict, triple_results_dict = reformat_openie_results(all_openie_info)
 
             # prepare data_store
             chunk_triples = [[text_processing(t) for t in triple_results_dict[chunk_id].triples] for chunk_id in self.passage_node_keys]
@@ -1801,6 +1785,7 @@ class RouteRAG:
 
         for rank, f in enumerate(top_k_facts):
             subject_phrase = f[0].lower()
+            predicate_phrase = f[1].lower()
             object_phrase = f[2].lower()
             fact_score = query_fact_scores[
                 top_k_fact_indices[rank]] if query_fact_scores.ndim > 0 else query_fact_scores

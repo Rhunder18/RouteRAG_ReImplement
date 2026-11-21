@@ -96,7 +96,7 @@ def text_processing(text):
     normalized = ''.join(character if character.isalnum() or character.isspace() else ' ' for character in text.casefold())
     return ' '.join(normalized.split())
 
-def reformat_openie_results(corpus_openie_results) -> (Dict[str, NerRawOutput], Dict[str, TripleRawOutput]):
+def reformat_openie_results(corpus_openie_results) -> tuple[Dict[str, NerRawOutput], Dict[str, TripleRawOutput]]:
 
     ner_output_dict = {
         chunk_item['idx']: NerRawOutput(
@@ -119,7 +119,7 @@ def reformat_openie_results(corpus_openie_results) -> (Dict[str, NerRawOutput], 
 
     return ner_output_dict, triple_output_dict
 
-def extract_entity_nodes(chunk_triples: List[List[Triple]]) -> (List[str], List[List[str]]):
+def extract_entity_nodes(chunk_triples: List[List[Triple]]) -> tuple[List[str], List[List[str]]]:
     chunk_triple_entities = []  # a list of lists of unique entities from each chunk's triples
     for triples in chunk_triples:
         triple_entities = set()

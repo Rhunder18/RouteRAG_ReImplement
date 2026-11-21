@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+from copy import deepcopy
 from dataclasses import asdict
 from typing import Union, Optional, List, Set, Dict, Any, Tuple
 import numpy as np
@@ -8,7 +9,15 @@ from tqdm import tqdm
 import igraph as ig
 import re
 import time
+import torch
+
 from filelock import FileLock
+from trl import GRPOConfig, GRPOTrainer
+from trl.models import unwrap_model_for_generation
+from trl.data_utils import is_conversational
+from trl.extras.profiling import profiling_context
+from trl.distributed import DistributedBackend
+from trl.trainer.utils import pad
 
 from .llm import _get_llm_class, BaseLLM, find_gateway
 from .embedding_model import _get_embedding_model_class, BaseEmbeddingModel
@@ -37,6 +46,7 @@ from .utils.embed_utils import retrieve_knn
 from .utils.config_utils import BaseConfig
 from .utils.state_utils import StateConsistencyError, component_class_identity, embedding_index_identity, remove_sources_from_mapping, validate_or_create_index_manifest
 from .utils.logging_utils import redact_config
+from .utils.routerag_utils import MAX_NEW_TOKENS, SYSTEM_PROMPT, STOP_STRINGS, RETHINK_MSG
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +103,7 @@ class RouteRAG:
             raise
 
     def __init__(self,
+                     model, tokenizer, max_budget=5, #Temporary parameters for the RouteRAG model and tokenizer, to be removed in future refactoring
                      global_config=None,
                      save_dir=None,
                      llm_model_name=None,
@@ -306,6 +317,11 @@ class RouteRAG:
             self._openie_info = None
             self._openie_provenance = None
             self.chunk_metadata = self._construct_or_cleanup(self._load_chunk_metadata)
+            
+            #Temporary parameters for the RouteRAG model and tokenizer, to be removed in future refactoring
+            self.model = model
+            self.tokenizer = tokenizer
+            self.max_budget = max_budget
 
     def _validate_or_create_index_manifest(self) -> None:
         manifest = {
@@ -888,6 +904,227 @@ class RouteRAG:
             return unique_docs, unique_scores
         else:
             return unique_docs
+    
+    def get_inside_query(self, search_str: str) -> str:
+        matches = re.findall(r"<search>(.*?)(?:</search>|$)", search_str, re.DOTALL)
+        if not matches:
+            return ""
+        inner_query = matches[0].strip()
+        return inner_query
+    
+    def format_information(self, retrieved_docs: List[str]) -> str:
+        if not retrieved_docs:
+            return None
+        search_result_text = ""
+        for i, doc in enumerate(retrieved_docs):
+            search_result_text += f"[Doc {i+1}]: {doc}\n"
+        # Update conversation state and reasoning process
+        informations = f"\n\n<information>{search_result_text}</information>\n\n"
+        return informations
+
+    def answer(self, question, verbose=False):
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Question: {question}"}
+        ]
+
+        base_prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        y = ""
+        b = 0
+        has_invalid_action = False
+        has_answered = False
+
+        while b < self.max_budget:
+            if verbose:
+                print(f"\nStep {b + 1} / {self.max_budget}")
+
+            current_input = base_prompt + y
+            inputs = self.tokenizer(current_input, add_special_tokens=False, return_tensors="pt").to(self.model.device)
+
+            outputs = self.model.generate(
+                **inputs,
+                stop_strings=["</search>", "</answer>"],
+                tokenizer=self.tokenizer,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                max_new_tokens=MAX_NEW_TOKENS
+            )
+
+            new_tokens = outputs[0][inputs.input_ids.shape[1]:]
+            y_b = self.tokenizer.decode(new_tokens, skip_special_tokens=False)
+
+            if verbose:
+                print(f"[Model Rollout]:\n{y_b}")
+
+            y += y_b
+
+            if "<search>" in y_b and "</search>" in y_b:
+                inner_query = self.get_inside_query(y_b)
+                if verbose:
+                    print(f"\n🔍: '{inner_query}'")
+                retrieved = self.search(
+                    query=inner_query,
+                    num_to_retrieve=3,
+                )
+                if verbose:
+                    print(f"[Retrieved]:\n{retrieved}") 
+                y += self.format_information(retrieved)
+            elif "<answer>" in y_b and "</answer>" in y_b:
+                if verbose:
+                    print("\n🎯 Done with the final answer!")
+                has_answered = True
+                break
+            else:
+                has_invalid_action = True
+                y += RETHINK_MSG
+            b += 1
+        return y, has_invalid_action, has_answered
+
+    def rollout_func(self, prompts: list[str], trainer: GRPOTrainer) -> dict[str, Any]:
+        device = trainer.accelerator.device
+        dist = DistributedBackend(trainer.accelerator)
+        tokenizer = trainer.processing_class
+        eos_set = set(trainer.eos_token_ids)
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+        def _tokenize_prompts(prompts):
+            if is_conversational({"prompt": prompts[0]}):
+                tokenized = trainer.processing_class.apply_chat_template(
+                    conversation=prompts,
+                    chat_template=trainer.chat_template,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=True,
+                    **trainer.chat_template_kwargs,
+                )
+                prompt_ids = tokenized["input_ids"]
+            else:
+                prompt_ids = trainer.processing_class(text=prompts)["input_ids"]
+            return prompt_ids
+
+        def _generate_single_turn(prompt_ids):
+            prompt_tensors = [torch.tensor(ids) for ids in prompt_ids]
+            padded_ids = pad(prompt_tensors, padding_value=pad_id, padding_side="left").to(device)
+            attention_mask = pad([torch.ones_like(t) for t in prompt_tensors], padding_value=0, padding_side="left").to(device)
+            generate_inputs = {"input_ids": padded_ids, "attention_mask": attention_mask}
+            with (
+                profiling_context(trainer, "transformers.generate"),
+                unwrap_model_for_generation(
+                    trainer.model_wrapped,
+                    trainer.accelerator,
+                    gather_deepspeed3_params=trainer.args.ds3_gather_for_generation,
+                    generation_kwargs=trainer.generation_kwargs,  
+                ) as unwrapped_model,
+                torch.no_grad(),
+                dist.summon_full_params(trainer.model_wrapped, recurse=False),
+            ):
+                prompt_completion_ids = unwrapped_model.generate(
+                    **generate_inputs, 
+                    tokenizer=tokenizer,
+                    stop_strings=["</search>", "</answer>"],
+                    generation_config=trainer.generation_config,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                )
+            # Compute prompt length and extract completion ids
+            prompt_length = generate_inputs["input_ids"].size(1)
+            completion_ids = prompt_completion_ids[:, prompt_length:]
+
+            # Mask everything after the first EOS token
+            is_eos = torch.isin(completion_ids, torch.tensor(trainer.eos_token_ids, device=device))
+            eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+            eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+            sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+            completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+            completion_ids = [
+                c[m].tolist() for c, m in zip(completion_ids.cpu(), completion_mask.bool().cpu(), strict=True)
+            ]
+            logprobs = None  # not used in this case 
+            return completion_ids, logprobs
+        
+        def _strip_padding(ids):
+            ids = list(ids)
+            if not ids:
+                return [], "", False
+            if ids[-1] in eos_set:
+                # Temporarily remove terminal EOS/PAD
+                head = ids[:-1]
+                # Remove trailing PAD if PAD and EOS are different
+                if pad_id not in eos_set:
+                    while head and head[-1] == pad_id:
+                        head.pop()
+                text = tokenizer.decode(head, skip_special_tokens=False).rstrip()
+                # Stop-string termination: final EOS is actually PAD
+                if any(s in text for s in STOP_STRINGS):
+                    return head, text, False
+                return ids, text, True
+            while ids and ids[-1] == pad_id:
+                ids.pop()
+            text = tokenizer.decode(ids,skip_special_tokens=False).rstrip()
+            return ids, text, False
+        
+        n = len(prompts)
+        prompt_ids = _tokenize_prompts(prompts)
+        _prompt_ids = deepcopy(prompt_ids)
+        completion_ids = [[] for _ in range(n)]
+        tool_mask = [[] for _ in range(n)]
+        search_times = [0] * n
+        invalid_action_counts = [0] * n
+        has_answers = [False] * n
+        done = [False] * n
+
+        def _extend(i, ids, m):
+            _prompt_ids[i].extend(ids)
+            completion_ids[i].extend(ids)
+            tool_mask[i].extend([m] * len(ids))
+
+        def _extend_text(i, text, m):
+            _extend(i, tokenizer(text, add_special_tokens=False)["input_ids"], m)
+
+        b = 0
+        while b < self.max_budget: 
+            idxs = [i for i in range(n) if not done[i]]
+            if not idxs:
+                break
+
+            new_ids, _ = _generate_single_turn([_prompt_ids[i] for i in idxs])
+
+            for i, ids in zip(idxs, new_ids):
+                ids, text, eos_hit = _strip_padding(ids)
+                _extend(i, ids, 1)
+                if "<search>" in text and "</search>" in text:
+                    inner_query = self.get_inside_query(text)
+                    start_time = time.time()
+                    retrieved_data = self.search(inner_query, k=3)
+                    search_times[i] += time.time() - start_time
+                    _extend_text(i, self.format_information(retrieved_data), 0)
+                elif "<answer>" in text and "</answer>" in text:
+                    has_answers[i] = True
+                    done[i] = True
+                    if not completion_ids[i] or completion_ids[i][-1] not in eos_set:
+                        _extend(i, [tokenizer.eos_token_id], 0)
+                elif eos_hit:
+                    # Genuine EOS without a valid action
+                    invalid_action_counts[i] += 1
+                    done[i] = True
+                else:
+                    invalid_action_counts[i] += 1
+                    _extend_text(i, RETHINK_MSG, 0)
+            b += 1
+
+        assert len(completion_ids) == len(prompt_ids)
+        assert len(tool_mask) == len(completion_ids)
+        for completion, mask in zip(completion_ids, tool_mask, strict=True):
+            assert len(completion) == len(mask)
+
+        return {
+            "prompt_ids": prompt_ids,
+            "completion_ids": completion_ids,
+            "logprobs": None,
+            "env_mask": tool_mask,
+            "search_times": search_times,
+            "invalid_action_counts": invalid_action_counts,
+            "has_answered": has_answers
+        }
     
     def add_fact_edges(self, chunk_ids: List[str], chunk_triples: List[Tuple]):
         """

@@ -103,7 +103,7 @@ class RouteRAG:
             raise
 
     def __init__(self,
-                     model, tokenizer, max_budget=5, #Temporary parameters for the RouteRAG model and tokenizer, to be removed in future refactoring
+                     model, tokenizer, max_budget=4, #Temporary parameters for the RouteRAG model and tokenizer, to be removed in future refactoring
                      global_config=None,
                      save_dir=None,
                      llm_model_name=None,
@@ -1094,7 +1094,7 @@ class RouteRAG:
                 if "<search>" in text and "</search>" in text:
                     inner_query = self.get_inside_query(text)
                     start_time = time.time()
-                    retrieved_data = self.search(inner_query, k=3)
+                    retrieved_data = self.search(inner_query, num_to_retrieve=3)
                     search_times[i] += time.time() - start_time
                     _extend_text(i, self.format_information(retrieved_data), 0)
                 elif "<answer>" in text and "</answer>" in text:

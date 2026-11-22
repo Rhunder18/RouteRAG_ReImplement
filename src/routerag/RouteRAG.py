@@ -914,7 +914,7 @@ class RouteRAG:
     
     def format_information(self, retrieved_docs: List[str]) -> str:
         if not retrieved_docs:
-            return None
+            return "\n\n<information>No relevant documents found.</information>\n\n"
         search_result_text = ""
         for i, doc in enumerate(retrieved_docs):
             search_result_text += f"[Doc {i+1}]: {doc}\n"
@@ -1078,6 +1078,8 @@ class RouteRAG:
             tool_mask[i].extend([m] * len(ids))
 
         def _extend_text(i, text, m):
+            if not isinstance(text, str):
+                text = ""
             _extend(i, tokenizer(text, add_special_tokens=False)["input_ids"], m)
 
         b = 0

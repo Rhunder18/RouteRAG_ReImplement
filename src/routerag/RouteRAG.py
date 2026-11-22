@@ -46,7 +46,7 @@ from .utils.embed_utils import retrieve_knn
 from .utils.config_utils import BaseConfig
 from .utils.state_utils import StateConsistencyError, component_class_identity, embedding_index_identity, remove_sources_from_mapping, validate_or_create_index_manifest
 from .utils.logging_utils import redact_config
-from .utils.routerag_utils import MAX_NEW_TOKENS, SYSTEM_PROMPT, STOP_STRINGS, RETHINK_MSG
+from .utils.routerag_utils import SYSTEM_PROMPT, STOP_STRINGS, RETHINK_MSG
 
 logger = logging.getLogger(__name__)
 
@@ -947,7 +947,6 @@ class RouteRAG:
                 tokenizer=self.tokenizer,
                 do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-                max_new_tokens=MAX_NEW_TOKENS
             )
 
             new_tokens = outputs[0][inputs.input_ids.shape[1]:]
@@ -1023,7 +1022,6 @@ class RouteRAG:
                     tokenizer=tokenizer,
                     stop_strings=["</search>", "</answer>"],
                     generation_config=trainer.generation_config,
-                    max_new_tokens=MAX_NEW_TOKENS,
                 )
             # Compute prompt length and extract completion ids
             prompt_length = generate_inputs["input_ids"].size(1)

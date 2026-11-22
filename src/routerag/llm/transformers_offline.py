@@ -1,5 +1,6 @@
 from typing import List
 import torch.cuda
+import gc
 import outlines.generate as generate
 import outlines.models as models
 from tqdm import tqdm
@@ -52,6 +53,18 @@ class TransformersOffline:
         if cache_dir is None:
             cache_dir = os.path.join(global_config.save_dir, "llm_cache")
         self.cache_file_name = os.path.join(cache_dir, cache_filename)
+        
+    def close(self):
+        """Release model, tokenizer and cached GPU memory."""
+        self.model = None
+        self.tokenizer = None
+
+        # Release Python objects whose reference count reached zero.
+        gc.collect()
+
+        # Release unused cached CUDA memory.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     def _generate_text(self, prompt_text: str, max_tokens: int) -> str:
         model_inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)

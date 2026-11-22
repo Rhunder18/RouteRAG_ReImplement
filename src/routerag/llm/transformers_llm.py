@@ -5,6 +5,7 @@ import json
 import time
 import hashlib
 import torch
+import gc
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from filelock import FileLock
@@ -118,6 +119,18 @@ class TransformersLLM(BaseLLM):
         if temperature > 0:
             generation_params["temperature"] = temperature
         return self.model.generate(inputs, **generation_params)
+    
+    def close(self):
+        """Release model, tokenizer and cached GPU memory."""
+        self.model = None
+        self.tokenizer = None
+
+        # Release Python objects whose reference count reached zero.
+        gc.collect()
+
+        # Release unused cached CUDA memory.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     def infer(self, messages: List[TextChatMessage], **kwargs) -> Tuple[str, dict, bool]:
         params = normalize_generation_token_params(self.llm_config.generate_params, kwargs, "max_new_tokens")

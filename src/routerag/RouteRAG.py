@@ -18,6 +18,7 @@ from trl.data_utils import is_conversational
 from trl.extras.profiling import profiling_context
 from trl.distributed import DistributedBackend
 from trl.trainer.utils import pad
+from trl.trainer.grpo_trainer import _BaseTrainer
 
 from .llm import _get_llm_class, BaseLLM, find_gateway
 from .embedding_model import _get_embedding_model_class, BaseEmbeddingModel
@@ -1004,9 +1005,10 @@ class RouteRAG:
 
         def _generate_single_turn(prompt_ids):
             prompt_tensors = [torch.tensor(ids) for ids in prompt_ids]
-            padded_ids = pad(prompt_tensors, padding_value=pad_id, padding_side="left").to(device)
-            attention_mask = pad([torch.ones_like(t) for t in prompt_tensors], padding_value=0, padding_side="left").to(device)
+            padded_ids = pad(prompt_tensors, padding_value=pad_id, padding_side="left")
+            attention_mask = pad([torch.ones_like(t) for t in prompt_tensors], padding_value=0, padding_side="left")
             generate_inputs = {"input_ids": padded_ids, "attention_mask": attention_mask}
+            generate_inputs = _BaseTrainer._prepare_inputs(trainer, generate_inputs)
             with (
                 profiling_context(trainer, "transformers.generate"),
                 unwrap_model_for_generation(

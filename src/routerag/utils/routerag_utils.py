@@ -16,7 +16,10 @@ Examples:
 - <search> [graph] lace plant programmed cell death </search>
 - <search> [graph][passage] lace plant leaf remodeling PCD </search>
 Retrieved evidence will be returned inside <information> and </information> tags. You can search iteratively as needed.
-Once you have sufficient evidence, reason inside <think>...</think> whether the evidence supports, refutes, or is inconclusive regarding the question. Then output the final decision strictly inside <answer> and </answer> using ONLY ONE of the following three options:
+
+Once you have sufficient evidence, reason inside <think>...</think> whether the evidence supports, refutes, or is inconclusive regarding the question. Then, provide your response in two parts:
+1. First, write a concise, evidence-based biomedical explanation (long answer) summarizing the key findings from the retrieved literature inside <long_answer> and </long_answer> tags.
+2. Second, output the final decision strictly inside <answer> and </answer> using ONLY ONE of the following three options:
 - <answer> yes </answer> : The literature/evidence clearly supports the hypothesis or question.
 - <answer> no </answer> : The literature/evidence refutes or does not support the hypothesis.
 - <answer> maybe </answer> : The findings are mixed, uncertain, limited, or inconclusive.

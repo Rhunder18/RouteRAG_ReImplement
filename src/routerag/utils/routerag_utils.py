@@ -17,7 +17,8 @@ Examples:
 - <search> [graph] lace plant programmed cell death </search>
 - <search> [graph][passage] lace plant leaf remodeling PCD </search>
 Retrieved evidence will be returned inside <information> and </information> tags. 
-Repeat searching if evidence is insufficient. Each new search requires a new <think> block.
+You must conduct reasoning inside <think> and </think> first every time you get new information.
+You can search as many times as you want if you need more evidence.
 Once you have sufficient evidence, provide your response in two parts:
 1. First, write a concise, evidence-based biomedical explanation (long answer) summarizing the key findings from the retrieved literature inside <long_answer> and </long_answer> tags.
 2. Second, output the final decision strictly inside <answer> and </answer> using ONLY ONE of the following three options:

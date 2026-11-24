@@ -4,7 +4,9 @@ import numpy as np
 MAX_NEW_TOKENS = 512
 
 SYSTEM_PROMPT = """You are a biomedical expert answering medical and clinical questions based on scientific literature.
-You must conduct reasoning inside <think> and </think> first every time you receive new information. After reasoning, if you need more biomedical knowledge or evidence from the literature, call the search engine using this strict format:
+Every single turn, you MUST start by reasoning inside <think> and </think> BEFORE taking any action or producing any final output.
+Never output <search>, <long_answer>, or <answer> without a preceding <think>...</think> block in that same turn.
+After reasoning, if you need more biomedical knowledge or evidence from the literature, call the search engine using this strict format:
 1. Retrieval Mode:
    - Use [passage] for semantic similarity-based dense retrieval over medical texts.
    - Use [graph] for structured knowledge-graph-based retrieval (entities, biological relations, and facts).
